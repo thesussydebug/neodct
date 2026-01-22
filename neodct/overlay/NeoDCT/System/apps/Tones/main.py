@@ -4,6 +4,7 @@ import subprocess
 import select
 
 from System.ui.framework import SoftKeyBar, MessageDialog, PagedList, VerticalList
+from System.core.SettingsStorage import set_setting
 
 ROOT_ID = 9
 SYSTEM_TONES_DIR = "/NeoDCT/System/tones"
@@ -162,6 +163,7 @@ def _show_ringing_tones(ui):
 
         elif key in (28, 96):  # ENTER / center
             player.stop()
+            set_setting("system.audio.ringtone", tones[vlist.selected_index]["path"])
             MessageDialog(ui, f"Ringtone set to {names[vlist.selected_index]}.").show()
             return
 

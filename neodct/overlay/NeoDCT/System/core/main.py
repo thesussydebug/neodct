@@ -13,6 +13,7 @@ import fcntl
 # --- THE FIX: Import ImageFile to handle "broken" JPEGs ---
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFile 
 from System.ui.framework import AppSelector, SoftKeyBar
+from System.core.SettingsStorage import get_setting
 import importlib.util
 import sqlite3
 from System.core.ModemService import ModemService
@@ -28,7 +29,7 @@ FB_PATH = "/dev/fb0"
 KEYPAD_PATH = "/dev/input/event0"
 WIDTH = 240
 HEIGHT = 240
-WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg" 
+WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
 
 # --- HARDWARE DRIVER ---
 class Framebuffer:
@@ -157,7 +158,17 @@ class NeoDCT_UI:
         self.image_cache = {}
         
         # --- WALLPAPER LOADING ---
-        self.wallpaper = self.load_wallpaper(WALLPAPER_PATH)
+        wallpaper_setting = get_setting("system.ui.wallpaper", "NONE")
+        wallpaper_path = None
+        if wallpaper_setting and wallpaper_setting.upper() != "NONE":
+            if wallpaper_setting.lower().endswith((".jpg", ".jpeg")) and os.path.exists(wallpaper_setting):
+                wallpaper_path = wallpaper_setting
+            else:
+                print(f"[UI] Invalid wallpaper setting: {wallpaper_setting}")
+                if os.path.exists(WALLPAPER_PATH):
+                    wallpaper_path = WALLPAPER_PATH
+
+        self.wallpaper = self.load_wallpaper(wallpaper_path) if wallpaper_path else None
         
         self.apps = []
         app_dir = "/NeoDCT/System/apps"
