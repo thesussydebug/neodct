@@ -39,7 +39,7 @@ qemu-system-aarch64 \
 qemu-system-aarch64 \
     -M virt \
     -cpu cortex-a53 \
-    -m 512 \
+    -m 1024 \
     -kernel output/images/Image \
     -drive file=output/images/rootfs.ext4,if=none,format=raw,id=hd0 \
     -device virtio-blk-device,drive=hd0 \
@@ -48,7 +48,10 @@ qemu-system-aarch64 \
     -device virtio-tablet-pci \
     -display gtk,gl=off,zoom-to-fit=off \
     -serial stdio \
-    -append "root=/dev/vda console=ttyAMA0 console=ttyS0,115200 vt.global_cursor_default=0 quiet loglevel=0 video=Virtual-1:256x256M"
+    -append "root=/dev/vda console=ttyAMA0 console=ttyS0,115200 vt.global_cursor_default=0 quiet loglevel=0 video=Virtual-1:240x240M" \
+-device intel-hda \
+-device hda-duplex,audiodev=audio0 \
+-audiodev pa,id=audio0
 
 qemu-system-aarch64     -M virt     -cpu cortex-a53     -m 512     -kernel output/images/Image     -drive file=output/images/rootfs.ext4,if=none,format=raw,id=hd0     -device virtio-blk-device,drive=hd0     -device virtio-gpu-pci     -device virtio-keyboard-pci     -device virtio-tablet-pci    -display gtk,gl=off,zoom-to-fit=off     -serial stdio     -append "root=/dev/vda rw console=ttyAMA0 quiet video=Virtual-1:240x240M vt.global_cursor_default=0"
 

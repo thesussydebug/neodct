@@ -4,6 +4,8 @@ SETTINGS_PATH = "/NeoDCT/User/settings.prop"
 DEFAULTS = {
     "system.audio.ringtone": "/NeoDCT/System/tones/Entertainer.wma",
     "system.ui.wallpaper": "NONE",
+    "system.os.versionnumber": "0.1.6a",
+    "system.os.versionname": "NeoDCT OS v0.1.6a M1",
 }
 
 
