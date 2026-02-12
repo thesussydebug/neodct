@@ -4,6 +4,16 @@
 buildroot/output/
 buildroot/dl/
 
+#####################
+# Codex information
+#####################
+neodct/AGENTS.md
+
+###################
+#Potentially copyrighted ringtones
+##################################
+neodct/overlay/NeoDCT/System/tones/*
+
 # Out-of-tree build dirs
 build-*/
 output-*/
