@@ -77,7 +77,9 @@ class AppSelector:
         """ Blocking loop """
         
         # --- INPUT FLUSH ---
-        if hasattr(self.ui, 'keypad_fd'):
+        if hasattr(self.ui, "flush_input"):
+            self.ui.flush_input()
+        elif hasattr(self.ui, 'keypad_fd'):
             while True:
                 r, w, x = select.select([self.ui.keypad_fd], [], [], 0.01)
                 if r:
@@ -536,6 +538,10 @@ class MessageDialog:
 
     def _flush_input(self):
         """Drain pending key events so OK doesn't instantly dismiss."""
+        if hasattr(self.ui, "flush_input"):
+            self.ui.flush_input()
+            return
+
         fd = getattr(self.ui, "keypad_fd", None)
         if fd is None:
             return
@@ -809,7 +815,9 @@ class PagedList:
     def show(self):
         """Blocking loop. Returns selected index or -1 for back."""
         # Input flush (mirrors AppSelector behavior)
-        if hasattr(self.ui, "keypad_fd"):
+        if hasattr(self.ui, "flush_input"):
+            self.ui.flush_input()
+        elif hasattr(self.ui, "keypad_fd"):
             while True:
                 r, _, _ = select.select([self.ui.keypad_fd], [], [], 0.01)
                 if r:

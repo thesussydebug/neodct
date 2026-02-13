@@ -64,6 +64,29 @@ class Framebuffer:
         self.mm.seek(0)
         self.mm.write(data[:self.size])
 
+
+class EvdevInput:
+    def __init__(self, path=KEYPAD_PATH):
+        self.path = path
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+
+    def read_keypress(self, timeout=0.1):
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return None
+
+        data = os.read(self.fd, 24)
+        if len(data) == 24:
+            sec, usec, ev_type, code, val = struct.unpack('llHHI', data)
+        elif len(data) == 16:
+            sec, usec, ev_type, code, val = struct.unpack('IIHHI', data)
+        else:
+             return None
+
+        if ev_type == 1 and val == 1:
+            return code
+        return None
+
 def init_databases():
         """ Checks for User DBs and creates them if missing. """
         
@@ -120,21 +143,27 @@ def init_databases():
 
 # --- UI LOGIC ---
 class NeoDCT_UI:
-    def __init__(self, fb_driver):
+    def __init__(self, fb_driver, input_backend=None):
         init_databases()       
     
         self.modem = ModemService()
         self.dial_buffer = "" 
+        self.fb = fb_driver
         
         self.DEV_KEYMAP = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 
             7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
             12: "-", 52: ".", 51: ",", 42: "*", 28: "#"
         }
-        self.keypad_fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
+
+        # Input can come from a display backend (Wayland) or direct evdev.
+        if input_backend is None and hasattr(fb_driver, "read_keypress"):
+            input_backend = fb_driver
+        self.input = input_backend or EvdevInput()
+        self.keypad_fd = getattr(self.input, "fd", None)
+
         self.softkey = SoftKeyBar(self)
 
-        self.fb = fb_driver
         self.canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
         self.draw = ImageDraw.Draw(self.canvas)
         
@@ -206,7 +235,7 @@ class NeoDCT_UI:
         except: return None
 
     def load_wallpaper(self, path):
-        """ Loads wallpaper, resizes to fit, and dims it by 70%. """
+        """ Loads wallpaper, resizes to fit, and dims it by 60%. """
         if not os.path.exists(path):
             print("[UI] No wallpaper found.")
             return None
@@ -223,9 +252,9 @@ class NeoDCT_UI:
             img = img.convert("RGB")
             img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
             
-            # Dim the image by 70% (Brightness 0.3) for text readability
+            # Dim the image by 60% (Brightness 0.3) for text readability
             enhancer = ImageEnhance.Brightness(img)
-            dimmed_img = enhancer.enhance(0.3)
+            dimmed_img = enhancer.enhance(0.4)
             
             return dimmed_img
 
@@ -355,6 +384,12 @@ class NeoDCT_UI:
             self.render_menu()
 
     def read_keypress(self, timeout=0.1):
+        if self.input and hasattr(self.input, "read_keypress"):
+            return self.input.read_keypress(timeout)
+
+        if self.keypad_fd is None:
+            return None
+
         r, _, _ = select.select([self.keypad_fd], [], [], timeout)
         if not r:
             return None
@@ -370,6 +405,22 @@ class NeoDCT_UI:
         if type == 1 and val == 1:
             return code
         return None
+
+    def flush_input(self):
+        if self.input and hasattr(self.input, "flush_input"):
+            return self.input.flush_input()
+
+        if self.keypad_fd is None:
+            return
+
+        while True:
+            r, _, _ = select.select([self.keypad_fd], [], [], 0.0)
+            if not r:
+                break
+            try:
+                os.read(self.keypad_fd, 24)
+            except Exception:
+                break
 
     def wait_for_key(self):
         while True:
@@ -406,8 +457,22 @@ class NeoDCT_UI:
             self.dial_buffer += char
             self.state = "HOME_DIALING"
 
-def run(fb):
-    ui = NeoDCT_UI(fb)
+def create_display_backend():
+    backend = os.environ.get("NEODCT_BACKEND", "").strip().lower()
+    if backend in ("wayland", "gtk", "wl"):
+        try:
+            from System.core.backend_wayland import WaylandBackend
+            print("[KERNEL] Using Wayland backend.")
+            return WaylandBackend(width=WIDTH, height=HEIGHT)
+        except Exception as exc:
+            print(f"[KERNEL] Wayland backend unavailable: {exc}")
+            print("[KERNEL] Falling back to framebuffer backend.")
+
+    return Framebuffer()
+
+
+def run(display_backend, input_backend=None):
+    ui = NeoDCT_UI(display_backend, input_backend=input_backend)
     print("[KERNEL] Entering Main Loop...")
 
     while True:
@@ -418,5 +483,5 @@ def run(fb):
             ui.handle_input(key)
 
 if __name__ == "__main__":
-    fb = Framebuffer()
-    run(fb)
+    backend = create_display_backend()
+    run(backend)

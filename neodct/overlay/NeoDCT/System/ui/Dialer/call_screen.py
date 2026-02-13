@@ -4,55 +4,21 @@
 # Invoked by kernel/main.py via:
 #   dialer_ui.show_calling(self, number, name=None)
 
-import os
 import time
-import struct
-import select
 from System.ui.framework import SoftKeyBar
 
-KEYPAD_PATH = "/dev/input/event0"
 WIDTH = 240
 HEIGHT = 240
 
 
-def _flush_input(fd):
+def _flush_input(ui):
     """Drain any pending key events so we don't instantly 'End' due to buffered input."""
-    try:
-        while True:
-            r, _, _ = select.select([fd], [], [], 0.0)
-            if not r:
-                break
-            os.read(fd, 24)
-    except Exception:
-        pass
+    if hasattr(ui, "flush_input"):
+        ui.flush_input()
 
 
-def _read_keypress(fd, timeout=0.10):
-    """
-    Returns a Linux input key code on key-press, else None.
-    Matches the event unpacking style used in kernel/main.py.
-    """
-    try:
-        r, _, _ = select.select([fd], [], [], timeout)
-        if not r:
-            return None
-
-        data = os.read(fd, 24)
-        if len(data) == 24:
-            sec, usec, etype, code, val = struct.unpack('llHHI', data)
-            if etype == 1 and val == 1:
-                return code
-
-        # Some platforms return 16-byte events
-        if len(data) == 16:
-            sec, usec, etype, code, val = struct.unpack('IIHHI', data)
-            if etype == 1 and val == 1:
-                return code
-
-    except Exception:
-        return None
-
-    return None
+def _read_keypress(ui, timeout=0.10):
+    return ui.read_keypress(timeout)
 
 
 def _draw_handset_icon(draw, x, y):
@@ -159,15 +125,7 @@ def show_calling(ui, number, name=None):
     Uses key 14 (Backspace/C) and also allows 28 (center) as End.
     """
     softkey = SoftKeyBar(ui)
-    # Open keypad if not already open on ui
-    fd = None
-    if hasattr(ui, "keypad_fd"):
-        fd = ui.keypad_fd
-    else:
-        fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
-        ui.keypad_fd = fd
-
-    _flush_input(fd)
+    _flush_input(ui)
 
     # Main loop: update screen periodically so clock updates
     last_draw = 0.0
@@ -179,7 +137,7 @@ def show_calling(ui, number, name=None):
             last_draw = now
             softkey.update("End")
 
-        key = _read_keypress(fd, timeout=0.10)
+        key = _read_keypress(ui, timeout=0.10)
         if key is None:
             continue
 

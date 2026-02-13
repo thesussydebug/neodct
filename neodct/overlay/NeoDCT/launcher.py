@@ -43,7 +43,7 @@ def show_boot_logo(fb):
 def main():
     # 1. Init Hardware
     print("[Launcher] Initializing Hardware...")
-    fb = ui_engine.Framebuffer() # We reuse the driver from main.py
+    fb = ui_engine.create_display_backend()
     
     # 2. Show Boot Splash
     show_boot_logo(fb)

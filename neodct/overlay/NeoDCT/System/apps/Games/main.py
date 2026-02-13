@@ -1,7 +1,4 @@
-import os
 import random
-import select
-import struct
 import time
 
 from System.ui.framework import SoftKeyBar
@@ -28,13 +25,10 @@ CELL = 12
 BOARD_TOP = 32  # Moved down slightly to give header room
 BOARD_HEIGHT = GRID_H * CELL 
 
-KEYPAD_PATH = "/dev/input/event0"
-
 class SnakeGame:
     def __init__(self, ui):
         self.ui = ui
         self.softkey = SoftKeyBar(ui)
-        self.keypad_fd = None
         self.reset()
 
     def reset(self):
@@ -47,41 +41,11 @@ class SnakeGame:
         self.spawn_food()
         self.render()
 
-    def ensure_keypad(self):
-        if self.keypad_fd is not None: return self.keypad_fd
-        if hasattr(self.ui, "keypad_fd"):
-            self.keypad_fd = self.ui.keypad_fd
-            return self.keypad_fd
-        try:
-            self.keypad_fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
-        except Exception:
-            self.keypad_fd = None
-        return self.keypad_fd
-
     def poll_key(self, timeout):
-        fd = self.ensure_keypad()
-        if fd is None:
+        if not hasattr(self.ui, "read_keypress"):
             time.sleep(timeout)
             return None
-
-        r, _, _ = select.select([fd], [], [], timeout)
-        if not r: return None
-
-        try:
-            data = os.read(fd, 24)
-            # Handle both 32-bit (16 byte) and 64-bit (24 byte) input events
-            if len(data) == 24:
-                _, _, etype, code, val = struct.unpack("llHHI", data)
-            elif len(data) == 16:
-                _, _, etype, code, val = struct.unpack("IIHHI", data)
-            else:
-                return None
-        except Exception:
-            return None
-
-        if etype == 1 and val == 1: # EV_KEY, Key Press
-            return code
-        return None
+        return self.ui.read_keypress(timeout)
 
     def direction_from_key(self, key):
         if key in (KEY_UP, KEY_NUM_2): return (0, -1)

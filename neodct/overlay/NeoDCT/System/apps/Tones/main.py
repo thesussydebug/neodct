@@ -1,7 +1,6 @@
 import os
 import time
 import subprocess
-import select
 
 from System.ui.framework import SoftKeyBar, MessageDialog, PagedList, VerticalList
 from System.core.SettingsStorage import set_setting
@@ -53,17 +52,8 @@ class TonePreviewPlayer:
 
 
 def _flush_input(ui):
-    fd = getattr(ui, "keypad_fd", None)
-    if fd is None:
-        return
-    while True:
-        r, _, _ = select.select([fd], [], [], 0.01)
-        if not r:
-            break
-        try:
-            os.read(fd, 24)
-        except Exception:
-            break
+    if hasattr(ui, "flush_input"):
+        ui.flush_input()
 
 
 def _scan_tones():

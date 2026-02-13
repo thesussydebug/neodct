@@ -2,4 +2,9 @@
 
 echo "Starting WebBrowser"
 
-sh /tests/neodct-browser/start.sh > /dev/ttyAMA0 2>&1 # LATER: make that if dev mode is turned on it will do that log.
+if [ -n "${WAYLAND_DISPLAY}" ]; then
+    echo "Wayland session detected: ${WAYLAND_DISPLAY}"
+    env GDK_GL=gles python3 /tests/neodct-browser/main.py > /dev/ttyAMA0 2>&1
+else
+    sh /tests/neodct-browser/start.sh > /dev/ttyAMA0 2>&1
+fi
