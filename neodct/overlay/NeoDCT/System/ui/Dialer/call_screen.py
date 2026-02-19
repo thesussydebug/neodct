@@ -11,8 +11,8 @@ import select
 from System.ui.framework import SoftKeyBar
 
 KEYPAD_PATH = "/dev/input/event0"
-WIDTH = 240
-HEIGHT = 240
+WIDTH = 300
+HEIGHT = 172
 
 
 def _flush_input(fd):
@@ -109,8 +109,13 @@ def draw_call_screen(ui, number, name=None):
     Top-right is clock (per your note).
     Bottom center softkey label is 'End'.
     """
+    screen_w = getattr(ui, "W", WIDTH)
+    screen_h = getattr(ui, "H", HEIGHT)
+    softkey_h = getattr(ui, "SOFTKEY_H", 30)
+    content_bottom = getattr(ui, "content_bottom", screen_h - softkey_h)
+
     # Clear full screen
-    ui.draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
 
     # --- Top left: handset icon (placeholder) ---
     # (You can replace this with a PNG later)
@@ -127,15 +132,15 @@ def draw_call_screen(ui, number, name=None):
     label = "Call 1"
     label_font = getattr(ui, "font_n", None) or getattr(ui, "font_s", None)
 
-    label_x = 40  # aligns nicely after handset icon
-    label_y = 58
+    label_x = max(34, int(screen_w * 0.23))
+    label_y = max(50, int(content_bottom * 0.20))
     ui.draw.text((label_x, label_y), label, font=label_font, fill="white")
 
     # Number directly under "Call 1"
     # (This is the specific change you requested.)
     num_text = number if number else ""
     # Fit within screen width with some right padding
-    fitted_num, num_font = _fit_text(ui, num_text, max_width=WIDTH - label_x - 10, prefer_font=label_font)
+    fitted_num, num_font = _fit_text(ui, num_text, max_width=screen_w - label_x - 10, prefer_font=label_font)
 
     num_y = label_y + 26  # Nokia-ish spacing under the label
     ui.draw.text((label_x, num_y), fitted_num, font=num_font, fill="white")
@@ -143,11 +148,12 @@ def draw_call_screen(ui, number, name=None):
     # Optional: if you ever want the contact name too, you can add it above/below.
     # Keeping it off by default to match your request.
 
-    for el in ui.home_layout.get("elements", []):
+    home_elements = (getattr(ui, "home_layout", None) or {}).get("elements", [])
+    for el in home_elements:
         if el.get("type") == "text" and el.get("text") == "12:00":
             ui.render_element(el)  # exact same placement and anchoring as HOME
             break
-    for el in ui.home_layout.get("elements", []):
+    for el in home_elements:
         if el.get("type") == "icon_set" and el.get("prefix") in ("bat", "sig"):
             ui.render_element(el)
 

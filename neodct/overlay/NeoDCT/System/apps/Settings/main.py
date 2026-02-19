@@ -76,35 +76,48 @@ def _wrap_text(ui, text, max_width, font):
 
 def _show_about(ui):
     title = "NeoDCT"
+    screen_w = getattr(ui, "W", 300)
+    screen_h = getattr(ui, "H", 172)
+    softkey_h = getattr(ui, "SOFTKEY_H", 30)
+    content_bottom = getattr(ui, "content_bottom", screen_h - softkey_h)
+    header_y = max(30, int(screen_h * 0.11))
+
     version_name = get_setting("system.os.versionname", "NeoDCT OS")
     version_number = get_setting("system.os.versionnumber", "")
     build_time = get_setting("system.os.buildtime", "Unknown")
     if not build_time or build_time.upper() == "NONE":
         build_time = "Unknown"
 
-    ui.draw.rectangle((0, 0, 240, 240), fill="black")
+    ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
 
     w, _ = ui.get_text_size(title, ui.font_n)
-    ui.draw.text(((240 - w) // 2, 12), title, font=ui.font_n, fill="white")
-    ui.draw.line((30, 32, 210, 32), fill="white")
+    ui.draw.text(((screen_w - w) // 2, 12), title, font=ui.font_n, fill="white")
+    line_pad = max(10, int(screen_w * 0.12))
+    ui.draw.line((line_pad, header_y, screen_w - line_pad, header_y), fill="white")
 
-    y = 45
+    y = header_y + 12
     if version_name:
-        name_lines = _wrap_text(ui, version_name, 220, ui.font_s)
+        name_lines = _wrap_text(ui, version_name, screen_w - 20, ui.font_s)
         for line in name_lines[:2]:
             w, _ = ui.get_text_size(line, ui.font_s)
-            ui.draw.text(((240 - w) // 2, y), line, font=ui.font_s, fill="white")
+            if y > content_bottom - 18:
+                break
+            ui.draw.text(((screen_w - w) // 2, y), line, font=ui.font_s, fill="white")
             y += 16
         y += 6
 
     if version_number:
-        ui.draw.text((15, y), f"Version: {version_number}", font=ui.font_s, fill="gray")
+        if y <= content_bottom - 18:
+            ui.draw.text((10, y), f"Version: {version_number}", font=ui.font_s, fill="gray")
         y += 16
-    ui.draw.text((15, y), "Build time:", font=ui.font_s, fill="gray")
+    if y <= content_bottom - 18:
+        ui.draw.text((10, y), "Build time:", font=ui.font_s, fill="gray")
     y += 16
-    build_lines = _wrap_text(ui, build_time, 210, ui.font_s)
+    build_lines = _wrap_text(ui, build_time, screen_w - 20, ui.font_s)
     for line in build_lines[:2]:
-        ui.draw.text((15, y), line, font=ui.font_s, fill="gray")
+        if y > content_bottom - 18:
+            break
+        ui.draw.text((10, y), line, font=ui.font_s, fill="gray")
         y += 16
 
     SoftKeyBar(ui).update("Back", present=False)

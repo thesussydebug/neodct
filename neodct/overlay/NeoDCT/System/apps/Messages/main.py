@@ -15,15 +15,28 @@ DB_DIR = "/NeoDCT/User/db"
 INBOX_DB = f"{DB_DIR}/sms_inbox.db"
 OUTBOX_DB = f"{DB_DIR}/sms_outbox.db"
 
+
+def _screen_metrics(ui):
+    screen_w = getattr(ui, "W", 300)
+    screen_h = getattr(ui, "H", 172)
+    softkey_h = getattr(ui, "SOFTKEY_H", 30)
+    content_bottom = getattr(ui, "content_bottom", screen_h - softkey_h)
+    header_y = max(30, int(screen_h * 0.11))
+    return screen_w, screen_h, content_bottom, header_y
+
+
 def _show_stub_screen(ui, title, root_id, sub_index):
-    ui.draw.rectangle((0, 0, 240, 240), fill="black")
+    screen_w, screen_h, content_bottom, header_y = _screen_metrics(ui)
+
+    ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
     ui.draw.text((5, 5), title, font=ui.font_xl, fill="white")
-    ui.draw.line((0, 35, 240, 35), fill="white")
+    ui.draw.line((0, header_y, screen_w, header_y), fill="white")
 
     HeaderWidget(ui, root_id).draw(sub_index)
 
-    ui.draw.text((10, 90), "Not implemented", font=ui.font_n, fill="white")
-    ui.draw.text((10, 115), "Press BACK", font=ui.font_n, fill="gray")
+    y = header_y + max(16, int((content_bottom - header_y) * 0.25))
+    ui.draw.text((10, y), "Not implemented", font=ui.font_n, fill="white")
+    ui.draw.text((10, y + 25), "Press BACK", font=ui.font_n, fill="gray")
 
     SoftKeyBar(ui).update("Back", present=False)
     ui.fb.update(ui.canvas)
@@ -124,13 +137,16 @@ def _save_outbox_message(text):
     conn.close()
 
 def _show_empty_state(ui, title, root_id, sub_index, message):
-    ui.draw.rectangle((0, 0, 240, 240), fill="black")
+    screen_w, screen_h, content_bottom, header_y = _screen_metrics(ui)
+
+    ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
     ui.draw.text((5, 5), title, font=ui.font_xl, fill="white")
-    ui.draw.line((0, 35, 240, 35), fill="white")
+    ui.draw.line((0, header_y, screen_w, header_y), fill="white")
     HeaderWidget(ui, root_id).draw(sub_index)
 
-    w, _ = ui.get_text_size(message, ui.font_n)
-    ui.draw.text(((240 - w) // 2, 110), message, font=ui.font_n, fill="white")
+    w, h = ui.get_text_size(message, ui.font_n)
+    y = header_y + max(0, ((content_bottom - header_y) - h) // 2)
+    ui.draw.text(((screen_w - w) // 2, y), message, font=ui.font_n, fill="white")
     SoftKeyBar(ui).update("Back", present=False)
     ui.fb.update(ui.canvas)
 
@@ -140,6 +156,7 @@ def _show_empty_state(ui, title, root_id, sub_index, message):
             return
 
 def _show_message_detail(ui, title, root_id, sub_index, message, message_id=None, sender=None, timestamp=None):
+    screen_w, screen_h, content_bottom, header_y = _screen_metrics(ui)
     softkey = SoftKeyBar(ui)
     header = HeaderWidget(ui, root_id)
 
@@ -149,22 +166,24 @@ def _show_message_detail(ui, title, root_id, sub_index, message, message_id=None
         meta_lines.append(f"From: {sender}")
     meta_lines.append(f"Time: {timestamp_text}")
 
-    body_lines = _wrap_text(ui, message, 220, ui.font_n)
+    body_lines = _wrap_text(ui, message, max(20, screen_w - 20), ui.font_n)
 
     while True:
-        ui.draw.rectangle((0, 0, 240, 240), fill="black")
+        ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
         ui.draw.text((5, 5), title, font=ui.font_xl, fill="white")
-        ui.draw.line((0, 35, 240, 35), fill="white")
+        ui.draw.line((0, header_y, screen_w, header_y), fill="white")
         header.draw(sub_index)
 
-        y = 45
+        y = header_y + 10
         for line in meta_lines:
+            if y > content_bottom - 18:
+                break
             ui.draw.text((10, y), line, font=ui.font_s, fill="gray")
             y += 18
 
         y += 4
         for line in body_lines:
-            if y > 210:
+            if y > content_bottom - 22:
                 break
             ui.draw.text((10, y), line, font=ui.font_n, fill="white")
             y += 22

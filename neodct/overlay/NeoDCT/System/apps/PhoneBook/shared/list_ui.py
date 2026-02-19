@@ -39,12 +39,15 @@ def show_contact_selector(ui, title="Contacts", btn_text="Select", search_query=
     
     # 2. Handle Empty State
     if not contacts:
-        ui.draw.rectangle((0,0,240,210), fill="black")
+        screen_w = getattr(ui, "W", 300)
+        content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 172) - getattr(ui, "SOFTKEY_H", 30))
+        ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
         msg = "No Results" if search_query else "No Contacts"
         
         # Center the text
         w, h = ui.get_text_size(msg, ui.font_n)
-        ui.draw.text(((240-w)//2, 100), msg, font=ui.font_n, fill="white")
+        y = max(10, (content_bottom - h) // 2)
+        ui.draw.text(((screen_w - w) // 2, y), msg, font=ui.font_n, fill="white")
         
         ui.fb.update(ui.canvas)
         time.sleep(1.5) # Let them read it

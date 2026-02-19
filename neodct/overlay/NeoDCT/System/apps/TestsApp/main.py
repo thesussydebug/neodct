@@ -1,8 +1,11 @@
 from System.ui.framework import SoftKeyBar, MessageDialog
 
 def run(ui):
+    screen_w = getattr(ui, "W", 300)
+    content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 172) - getattr(ui, "SOFTKEY_H", 30))
+
     # Clear screen
-    ui.draw.rectangle((0, 0, 240, 210), fill="black")
+    ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
     softkey = SoftKeyBar(ui)
     softkey.update("Testing123")
     warningmsg = MessageDialog(ui, "This is a test of the error screen")
@@ -11,7 +14,7 @@ def run(ui):
     text = "Hello World"
     w, h = ui.get_text_size(text, ui.font_xl)
     ui.draw.text(
-        ((240 - w) // 2, (240 - h) // 2),
+        ((screen_w - w) // 2, (content_bottom - h) // 2),
         text,
         font=ui.font_xl,
         fill="white"

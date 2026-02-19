@@ -12,8 +12,10 @@ from System.core import main as ui_engine
 
 def show_boot_logo(fb):
     from PIL import Image, ImageDraw, ImageFont
+    screen_w = getattr(ui_engine, "UI_WIDTH", 300)
+    screen_h = getattr(ui_engine, "UI_HEIGHT", 172)
     
-    canvas = Image.new("RGB", (240, 240), "black")
+    canvas = Image.new("RGB", (screen_w, screen_h), "black")
     draw = ImageDraw.Draw(canvas)
     
     try:
@@ -29,13 +31,14 @@ def show_boot_logo(fb):
     # textbbox returns (left, top, right, bottom)
     bbox = draw.textbbox((0, 0), text, font=font)
     w = bbox[2] - bbox[0] # Calculate width
-    draw.text(((240-w)//2, 100), text, font=font, fill="white")
+    title_y = max(20, int(screen_h * 0.35))
+    draw.text(((screen_w - w) // 2, title_y), text, font=font, fill="white")
     
     # Draw Version
-    ver = "System v0.1.6a M1"
+    ver = "System v0.1.8a M1"
     bbox = draw.textbbox((0, 0), ver, font=font_small)
     w = bbox[2] - bbox[0]
-    draw.text(((240-w)//2, 130), ver, font=font_small, fill="gray")
+    draw.text(((screen_w - w) // 2, title_y + 30), ver, font=font_small, fill="gray")
     # --- FIX END ---
     
     fb.update(canvas)

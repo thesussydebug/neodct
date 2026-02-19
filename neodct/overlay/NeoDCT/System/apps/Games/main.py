@@ -24,9 +24,6 @@ KEY_NUM_8 = 9
 # Display + board sizing
 GRID_W = 20
 GRID_H = 14
-CELL = 12
-BOARD_TOP = 32  # Moved down slightly to give header room
-BOARD_HEIGHT = GRID_H * CELL 
 
 KEYPAD_PATH = "/dev/input/event0"
 
@@ -35,7 +32,26 @@ class SnakeGame:
         self.ui = ui
         self.softkey = SoftKeyBar(ui)
         self.keypad_fd = None
+        self.screen_w = getattr(ui, "W", 300)
+        self.screen_h = getattr(ui, "H", 172)
+        self.softkey_h = getattr(ui, "SOFTKEY_H", 30)
+        self.content_bottom = getattr(ui, "content_bottom", self.screen_h - self.softkey_h)
+        self._compute_layout()
         self.reset()
+
+    def _compute_layout(self):
+        self.header_h = max(28, int(self.screen_h * 0.10))
+        content_top = self.header_h + 6
+        usable_h = max(1, self.content_bottom - content_top - 2)
+        max_cell_w = max(1, (self.screen_w - 4) // GRID_W)
+        max_cell_h = max(1, usable_h // GRID_H)
+        self.cell = max(4, min(max_cell_w, max_cell_h))
+
+        self.board_w = GRID_W * self.cell
+        self.board_h = GRID_H * self.cell
+        self.board_x = max(0, (self.screen_w - self.board_w) // 2)
+        self.board_top = content_top + max(0, (usable_h - self.board_h) // 2)
+        self.board_bottom = self.board_top + self.board_h
 
     def reset(self):
         cx, cy = GRID_W // 2, GRID_H // 2
@@ -122,48 +138,55 @@ class SnakeGame:
 
     def render(self):
         # 1. Clear Screen
-        self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
+        self.ui.draw.rectangle((0, 0, self.screen_w, self.content_bottom), fill="black")
 
         # 2. Header (Smaller Font, Monochrome)
         self.ui.draw.text((5, 5), "Snake", font=self.ui.font_md, fill="white")
         
         score_text = f"{self.score}"
         w, h = self.ui.get_text_size(score_text, self.ui.font_md)
-        self.ui.draw.text((235 - w, 5), score_text, font=self.ui.font_md, fill="white")
+        self.ui.draw.text((self.screen_w - 5 - w, 5), score_text, font=self.ui.font_md, fill="white")
 
         # 3. Board Outline
-        board_bottom = BOARD_TOP + BOARD_HEIGHT
-        self.ui.draw.rectangle((0, BOARD_TOP, 239, board_bottom), outline="white")
+        self.ui.draw.rectangle(
+            (self.board_x, self.board_top, self.board_x + self.board_w - 1, self.board_bottom - 1),
+            outline="white",
+        )
 
         # 4. Food (Hollow Box style)
         if self.food:
-            fx = self.food[0] * CELL
-            fy = BOARD_TOP + (self.food[1] * CELL)
+            fx = self.board_x + (self.food[0] * self.cell)
+            fy = self.board_top + (self.food[1] * self.cell)
             # Draw outline white, fill black
-            self.ui.draw.rectangle((fx + 1, fy + 1, fx + CELL - 2, fy + CELL - 2), outline="white", fill="black")
+            self.ui.draw.rectangle(
+                (fx + 1, fy + 1, fx + self.cell - 2, fy + self.cell - 2),
+                outline="white",
+                fill="black",
+            )
 
         # 5. Snake (Solid White)
         for idx, (x, y) in enumerate(self.snake):
-            px = x * CELL
-            py = BOARD_TOP + (y * CELL)
-            self.ui.draw.rectangle((px + 1, py + 1, px + CELL - 2, py + CELL - 2), fill="white")
+            px = self.board_x + (x * self.cell)
+            py = self.board_top + (y * self.cell)
+            self.ui.draw.rectangle((px + 1, py + 1, px + self.cell - 2, py + self.cell - 2), fill="white")
 
         # 6. Softkey
         self.softkey.update("Back") # Handles flush
 
     def game_over(self):
         # 1. Clear Entire Screen
-        self.ui.draw.rectangle((0, 0, 240, 240), fill="black")
+        self.ui.draw.rectangle((0, 0, self.screen_w, self.screen_h), fill="black")
         
         # 2. Big "Game Over"
         text = "GAME OVER"
         w, h = self.ui.get_text_size(text, self.ui.font_xl)
-        self.ui.draw.text(((240 - w) // 2, 60), text, font=self.ui.font_xl, fill="white")
+        y_title = max(20, int(self.content_bottom * 0.28))
+        self.ui.draw.text(((self.screen_w - w) // 2, y_title), text, font=self.ui.font_xl, fill="white")
         
         # 3. Score
         score_text = f"Score: {self.score}"
         w2, h2 = self.ui.get_text_size(score_text, self.ui.font_md)
-        self.ui.draw.text(((240 - w2) // 2, 100), score_text, font=self.ui.font_md, fill="white")
+        self.ui.draw.text(((self.screen_w - w2) // 2, y_title + 42), score_text, font=self.ui.font_md, fill="white")
 
         # 4. Instructions
         prompt = "Restart"

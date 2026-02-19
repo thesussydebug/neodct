@@ -137,21 +137,28 @@ class MusicPlayer:
             self.is_paused = True
 
     def run_now_playing(self, filepath):
+        screen_w = getattr(self.ui, "W", 300)
+        screen_h = getattr(self.ui, "H", 172)
+        softkey_h = getattr(self.ui, "SOFTKEY_H", 30)
+        content_bottom = getattr(self.ui, "content_bottom", screen_h - softkey_h)
+        header_h = max(24, int(screen_h * 0.08))
+
         # 1. Load Data
-        self.ui.draw.rectangle((0, 0, 240, 240), fill="black")
-        self.ui.draw.text((80, 100), "Loading...", font=self.ui.font_n, fill="white")
+        self.ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
+        lw, lh = self.ui.get_text_size("Loading...", self.ui.font_n)
+        self.ui.draw.text(((screen_w - lw) // 2, max(10, (content_bottom - lh) // 2)), "Loading...", font=self.ui.font_n, fill="white")
         self.ui.fb.update(self.ui.canvas)
         
         meta = self.get_metadata(filepath)
         
         # 2. Resize Art (Smaller now, for side layout)
         display_art = None
-        ART_SIZE = 100
+        art_size = min(100, max(64, int(screen_w * 0.42)))
         
         if meta["art"]:
             try:
                 meta["art"].load()
-                display_art = meta["art"].resize((ART_SIZE, ART_SIZE), Image.Resampling.NEAREST)
+                display_art = meta["art"].resize((art_size, art_size), Image.Resampling.NEAREST)
             except Exception:
                 display_art = None
         
@@ -160,14 +167,21 @@ class MusicPlayer:
         total_paused_duration = 0
         
         # --- NEW LAYOUT CONSTANTS ---
-        # Art on Left
-        ART_X = 10
-        ART_Y = 45 
-        
-        # Text on Right (starts at 120px)
-        TEXT_X = 120
-        TEXT_WIDTH = 240 - TEXT_X - 5 # ~115px wide
-        
+        art_x = 8
+        art_y = header_h + 12
+        text_x = art_x + art_size + 8
+        text_width = max(30, screen_w - text_x - 8)
+        bar_width = max(48, screen_w - 20)
+        bar_x = (screen_w - bar_width) // 2
+        bar_y = content_bottom - 18
+
+        # Keep art fully above progress/timestamps.
+        available_media_h = max(48, bar_y - art_y - 18)
+        art_size = min(art_size, available_media_h)
+
+        if display_art and display_art.size != (art_size, art_size):
+            display_art = display_art.resize((art_size, art_size), Image.Resampling.NEAREST)
+
         needs_redraw = True
 
         while True:
@@ -190,24 +204,24 @@ class MusicPlayer:
             # DRAW
             if needs_redraw:
                 # Clear Content Area
-                self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
+                self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
 
                 # -- Header --
-                self.ui.draw.rectangle((0, 0, 240, 25), fill="white")
+                self.ui.draw.rectangle((0, 0, screen_w, header_h), fill="white")
                 w, h = self.ui.get_text_size("Now Playing", self.ui.font_s)
-                self.ui.draw.text(((240-w)//2, 5), "Now Playing", font=self.ui.font_s, fill="black")
+                self.ui.draw.text(((screen_w - w) // 2, max(2, (header_h - h) // 2)), "Now Playing", font=self.ui.font_s, fill="black")
 
                 # -- Album Art (Left) --
                 if display_art:
-                    self.ui.canvas.paste(display_art, (ART_X, ART_Y))
-                    self.ui.draw.rectangle((ART_X-1, ART_Y-1, ART_X+ART_SIZE, ART_Y+ART_SIZE), outline="white")
+                    self.ui.canvas.paste(display_art, (art_x, art_y))
+                    self.ui.draw.rectangle((art_x - 1, art_y - 1, art_x + art_size, art_y + art_size), outline="white")
                 else:
-                    self.ui.draw.rectangle((ART_X, ART_Y, ART_X+ART_SIZE, ART_Y+ART_SIZE), outline="white")
+                    self.ui.draw.rectangle((art_x, art_y, art_x + art_size, art_y + art_size), outline="white")
                     # Note Icon
-                    cx, cy = ART_X + 50, ART_Y + 50
-                    self.ui.draw.ellipse((cx-10, cy+20, cx, cy+30), fill="white")
-                    self.ui.draw.line((cx, cy+25, cx, cy-10), fill="white", width=2)
-                    self.ui.draw.line((cx, cy-10, cx+15, cy-5), fill="white", width=2)
+                    cx, cy = art_x + (art_size // 2), art_y + (art_size // 2)
+                    self.ui.draw.ellipse((cx - 8, cy + 8, cx + 1, cy + 17), fill="white")
+                    self.ui.draw.line((cx + 1, cy + 12, cx + 1, cy - 12), fill="white", width=2)
+                    self.ui.draw.line((cx + 1, cy - 12, cx + 14, cy - 8), fill="white", width=2)
 
                 # -- Info (Right) --
                 # Helper to truncate text to fit right column
@@ -220,41 +234,37 @@ class MusicPlayer:
                     return t + "..." if len(t) < len(text) else t
 
                 # Title (Bold)
-                t_str = truncate(meta["title"], self.ui.font_n, TEXT_WIDTH)
-                self.ui.draw.text((TEXT_X, ART_Y), t_str, font=self.ui.font_n, fill="white")
+                t_str = truncate(meta["title"], self.ui.font_n, text_width)
+                self.ui.draw.text((text_x, art_y), t_str, font=self.ui.font_n, fill="white")
                 
                 # Artist (Regular)
-                a_str = truncate(meta["artist"], self.ui.font_s, TEXT_WIDTH)
-                self.ui.draw.text((TEXT_X, ART_Y + 25), a_str, font=self.ui.font_s, fill="#cccccc")
+                a_str = truncate(meta["artist"], self.ui.font_s, text_width)
+                self.ui.draw.text((text_x, art_y + 25), a_str, font=self.ui.font_s, fill="#cccccc")
                 
                 # Album (Regular, below Artist)
                 if meta["album"]:
-                    al_str = truncate(meta["album"], self.ui.font_s, TEXT_WIDTH)
-                    self.ui.draw.text((TEXT_X, ART_Y + 45), al_str, font=self.ui.font_s, fill="#999999")
+                    al_str = truncate(meta["album"], self.ui.font_s, text_width)
+                    self.ui.draw.text((text_x, art_y + 45), al_str, font=self.ui.font_s, fill="#999999")
 
                 # -- Progress Bar (Bottom) --
-                BAR_Y = 190
-                BAR_WIDTH = 200
-                BAR_X = 20
-                
-                self.ui.draw.rectangle((BAR_X, BAR_Y, BAR_X + BAR_WIDTH, BAR_Y+4), fill="#333333")
+                self.ui.draw.rectangle((bar_x, bar_y, bar_x + bar_width, bar_y + 4), fill="#333333")
                 
                 if meta["length"] > 0:
                     pct = min(1.0, current_elapsed / meta["length"])
                 else:
                     pct = 0
                     
-                fill_width = int(BAR_WIDTH * pct)
-                self.ui.draw.rectangle((BAR_X, BAR_Y, BAR_X + fill_width, BAR_Y+4), fill="white")
+                fill_width = int(bar_width * pct)
+                self.ui.draw.rectangle((bar_x, bar_y, bar_x + fill_width, bar_y + 4), fill="white")
                 
                 # Timestamps
                 curr_str = self.format_time(int(current_elapsed))
-                self.ui.draw.text((BAR_X, BAR_Y - 15), curr_str, font=self.ui.font_s, fill="white")
+                self.ui.draw.text((bar_x, bar_y - 15), curr_str, font=self.ui.font_s, fill="white")
                 
                 if meta["length"] > 0:
                     total_str = "-" + self.format_time(int(meta["length"] - current_elapsed))
                     w, h = self.ui.get_text_size(total_str, self.ui.font_s)
-                    self.ui.draw.text((BAR_X + BAR_WIDTH - w, BAR_Y - 15), total_str, font=self.ui.font_s, fill="white")
+                    self.ui.draw.text((bar_x + bar_width - w, bar_y - 15), total_str, font=self.ui.font_s, fill="white")
 
                 self.softkey.update("Pause" if not self.is_paused else "Play")
                 needs_redraw = False
@@ -274,12 +284,19 @@ class MusicPlayer:
 
     def run(self):
         while True:
+            screen_w = getattr(self.ui, "W", 300)
+            content_bottom = getattr(
+                self.ui,
+                "content_bottom",
+                getattr(self.ui, "H", 172) - getattr(self.ui, "SOFTKEY_H", 30),
+            )
             self.scan_music()
             if not self.playlist:
-                self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
-                self.ui.draw.text((10, 80), "No Music Found", font=self.ui.font_n, fill="white")
-                self.ui.draw.text((10, 110), f"Add mp3s to:", font=self.ui.font_s, fill="gray")
-                self.ui.draw.text((10, 130), "/User/music", font=self.ui.font_s, fill="gray")
+                self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+                y = max(12, int(content_bottom * 0.35))
+                self.ui.draw.text((10, y), "No Music Found", font=self.ui.font_n, fill="white")
+                self.ui.draw.text((10, y + 30), "Add mp3s to:", font=self.ui.font_s, fill="gray")
+                self.ui.draw.text((10, y + 50), "/User/music", font=self.ui.font_s, fill="gray")
                 self.softkey.update("Exit")
                 while True:
                     k = self.ui.wait_for_key()

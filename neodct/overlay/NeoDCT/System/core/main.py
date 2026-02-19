@@ -27,8 +27,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 FB_PATH = "/dev/fb0"
 KEYPAD_PATH = "/dev/input/event0"
-WIDTH = 240
-HEIGHT = 240
+UI_WIDTH = 300
+UI_HEIGHT = 172
+SOFTKEY_HEIGHT = 30
+WIDTH = UI_WIDTH
+HEIGHT = UI_HEIGHT
 WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
 
 # --- HARDWARE DRIVER ---
@@ -51,15 +54,26 @@ class Framebuffer:
 
     def update(self, pil_image):
         stride_pixels = self.line_length // (self.bpp // 8)
-        
+        native_img = Image.new("RGB", (stride_pixels, self.yres), "black")
+
+        src = pil_image.convert("RGB")
+        copy_w = min(src.width, self.xres)
+        copy_h = min(src.height, self.yres)
+
+        src_x = max(0, (src.width - copy_w) // 2)
+        src_y = max(0, (src.height - copy_h) // 2)
+        cropped = src.crop((src_x, src_y, src_x + copy_w, src_y + copy_h))
+
+        dst_x = max(0, (self.xres - copy_w) // 2)
+        dst_y = max(0, (self.yres - copy_h) // 2)
+        native_img.paste(cropped, (dst_x, dst_y))
+
         if self.bpp == 32:
-            native_img = Image.new("RGB", (stride_pixels, self.yres), "black")
-            native_img.paste(pil_image, (0, 0))
             data = native_img.convert("RGBA").tobytes("raw", "BGRA")
         elif self.bpp == 16:
-            native_img = Image.new("RGB", (stride_pixels, self.yres), "black")
-            native_img.paste(pil_image, (0, 0))
             data = native_img.convert("RGB").tobytes("raw", "BGR;16")
+        else:
+            data = native_img.convert("RGB").tobytes()
             
         self.mm.seek(0)
         self.mm.write(data[:self.size])
@@ -69,7 +83,7 @@ def init_databases():
         
         db_path = "/NeoDCT/User/db"
         if not os.path.exists(db_path):
-            print(f"[KERNEL] Creating User DB directory: {db_path}")
+            print(f"[CORE] Creating User DB directory: {db_path}")
             os.makedirs(db_path)
             
         # --- PHONEBOOK DB ---
@@ -85,7 +99,7 @@ def init_databases():
                       
         c.execute("SELECT count(*) FROM contacts")
         if c.fetchone()[0] == 0:
-            print("[KERNEL] Seeding default contacts...")
+            print("[CORE] Seeding default contacts...")
             c.execute("INSERT INTO contacts (name, number, speed_dial) VALUES (?, ?, ?)", 
                       ("NeoDCT Support", "555-1234", 2))
             conn.commit()
@@ -116,7 +130,7 @@ def init_databases():
         conn.commit()
         conn.close()
 
-        print("[KERNEL] Databases initialized successfully.")
+        print("[CORE] Databases initialized successfully.")
 
 # --- UI LOGIC ---
 class NeoDCT_UI:
@@ -131,11 +145,15 @@ class NeoDCT_UI:
             7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
             12: "-", 52: ".", 51: ",", 42: "*", 28: "#"
         }
+        self.W = UI_WIDTH
+        self.H = UI_HEIGHT
+        self.SOFTKEY_H = SOFTKEY_HEIGHT
+        self.content_bottom = self.H - self.SOFTKEY_H
         self.keypad_fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
         self.softkey = SoftKeyBar(self)
 
         self.fb = fb_driver
-        self.canvas = Image.new("RGB", (WIDTH, HEIGHT), "black")
+        self.canvas = Image.new("RGB", (self.W, self.H), "black")
         self.draw = ImageDraw.Draw(self.canvas)
         
         self.state = "HOME"
@@ -145,11 +163,12 @@ class NeoDCT_UI:
             self.font_s = ImageFont.truetype(font_path, 14)
             self.font_md = ImageFont.truetype(font_path, 18) 
             self.font_n = ImageFont.truetype(font_path, 20)
-            self.font_xl = ImageFont.truetype(font_path, 28) 
+            self.font_xl = ImageFont.truetype(font_path, 24) 
             print("[UI] Custom font loaded.")
         except:
             print("[UI] Font load failed, using default.")
             self.font_s = ImageFont.load_default()
+            self.font_md = ImageFont.load_default()
             self.font_n = ImageFont.load_default()
             self.font_xl = ImageFont.load_default()
 
@@ -221,7 +240,7 @@ class NeoDCT_UI:
             
             # Convert and Resize
             img = img.convert("RGB")
-            img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+            img = img.resize((self.W, self.H), Image.Resampling.LANCZOS)
             
             # Dim the image by 70% (Brightness 0.3) for text readability
             enhancer = ImageEnhance.Brightness(img)
@@ -267,7 +286,8 @@ class NeoDCT_UI:
             else: font = self.font_s
             
             w, h = self.get_text_size(text, font)
-            x, y = el["x"], el["y"]
+            x = int((el["x"] / 240.0) * self.W)
+            y = int((el["y"] / 240.0) * self.H)
             
             if "center_h" in el["anchor"]: x -= w // 2
             elif "right" in el["anchor"]: x -= w
@@ -277,15 +297,26 @@ class NeoDCT_UI:
         elif el["type"] == "icon_set":
             val = 3 
             custom_path = el.get("custom_images", {}).get(str(val))
+            x = int((el["x"] / 240.0) * self.W)
+            y = int((el["y"] / 240.0) * self.H)
             if custom_path:
                 img = self.get_image(custom_path)
-                if img: self.canvas.paste(img, (el["x"], el["y"]), img)
+                if img:
+                    # Home layout coordinates are authored for 240px-tall UI.
+                    # Scale icon assets by height ratio so status icons don't clip on shorter displays.
+                    icon_scale = self.H / 240.0
+                    scaled_w = max(1, int(img.width * icon_scale))
+                    scaled_h = max(1, int(img.height * icon_scale))
+                    if (scaled_w, scaled_h) != img.size:
+                        img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+                    self.canvas.paste(img, (x, y), img)
             else:
                 for i in range(el["count"]):
                     h = (i + 1) * 3
                     color = "white" if i <= val else "#333333"
-                    bx = el["x"] + (i * 5)
-                    self.draw.rectangle((bx, el["y"] + 15 - h, bx + 3, el["y"] + 15), fill=color)
+                    step = max(3, int(self.W * 0.021))
+                    bx = x + (i * step)
+                    self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
 
     def render_home(self):
         # 1. Background Logic
@@ -295,11 +326,13 @@ class NeoDCT_UI:
             bg_path = self.home_layout.get("background")
             if bg_path:
                 bg = self.get_image(bg_path)
-                if bg: self.canvas.paste(bg, (0,0))
+                if bg:
+                    bg = bg.convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
+                    self.canvas.paste(bg, (0, 0))
             else:
-                self.draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+                self.draw.rectangle((0, 0, self.W, self.H), fill="black")
         else:
-             self.draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+            self.draw.rectangle((0, 0, self.W, self.H), fill="black")
 
         # 2. Render Elements
         if self.home_layout:
@@ -310,16 +343,14 @@ class NeoDCT_UI:
 
     def render_home_dialing(self):
         if self.wallpaper:
-             self.canvas.paste(self.wallpaper, (0, 0))
+            self.canvas.paste(self.wallpaper, (0, 0))
         else:
-             self.draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+            self.draw.rectangle((0, 0, self.W, self.H), fill="black")
         
         if self.dial_buffer:
             w, h = self.get_text_size(self.dial_buffer, self.font_xl)
-            self.draw.text(((WIDTH - w)//2, 80), self.dial_buffer, font=self.font_xl, fill="white")
-        
-        w, h = self.get_text_size("Call", self.font_n)
-        self.draw.text(((WIDTH - w)//2, 210), "Call", font=self.font_n, fill="white")
+            y = max(50, int(self.content_bottom * 0.35))
+            self.draw.text(((self.W - w)//2, y), self.dial_buffer, font=self.font_xl, fill="white")
 
 
     def launch_app(self, app):
@@ -408,7 +439,7 @@ class NeoDCT_UI:
 
 def run(fb):
     ui = NeoDCT_UI(fb)
-    print("[KERNEL] Entering Main Loop...")
+    print("[CORE] Entering Main Loop...")
 
     while True:
         ui.update()

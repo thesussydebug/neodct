@@ -8,6 +8,25 @@ import System.apps.PhoneBook.shared.list_ui as contact_manager
 sys.stdout = open('/dev/ttyAMA0', 'w')
 sys.stderr = sys.stdout
 
+
+def _screen_metrics(ui):
+    screen_w = getattr(ui, "W", 300)
+    screen_h = getattr(ui, "H", 172)
+    softkey_h = getattr(ui, "SOFTKEY_H", 30)
+    content_bottom = getattr(ui, "content_bottom", screen_h - softkey_h)
+    return screen_w, screen_h, content_bottom
+
+
+def _draw_center_message(ui, text, duration=1.0, font=None, fill="white"):
+    screen_w, _, content_bottom = _screen_metrics(ui)
+    font = font or ui.font_xl
+    ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+    w, h = ui.get_text_size(text, font)
+    y = max(10, (content_bottom - h) // 2)
+    ui.draw.text(((screen_w - w) // 2, y), text, font=font, fill=fill)
+    ui.fb.update(ui.canvas)
+    time.sleep(duration)
+
 def run(ui):
     # --- LEVEL 1: MAIN MENU ---
     main_items = [
@@ -92,11 +111,7 @@ def add_entry_action(ui):
                   (name, number, 0))
         conn.commit()
         conn.close()
-        
-        ui.draw.rectangle((0,0,240,210), fill="black")
-        ui.draw.text((80, 100), "Saved!", font=ui.font_xl, fill="white")
-        ui.fb.update(ui.canvas)
-        time.sleep(1)
+        _draw_center_message(ui, "Saved!")
     except Exception as e:
         print(f"[PB] Save Error: {e}")
 
@@ -118,11 +133,7 @@ def edit_contact_action(ui, contact):
                   (new_name, new_number, contact_id))
         conn.commit()
         conn.close()
-        
-        ui.draw.rectangle((0,0,240,210), fill="black")
-        ui.draw.text((80, 100), "Updated!", font=ui.font_xl, fill="white")
-        ui.fb.update(ui.canvas)
-        time.sleep(1)
+        _draw_center_message(ui, "Updated!")
     except Exception as e:
         print(f"[PB] Update Error: {e}")
 
@@ -135,11 +146,7 @@ def delete_contact_action(ui, contact):
     c.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
     conn.commit()
     conn.close()
-            
-    ui.draw.rectangle((0,0,240,210), fill="black")
-    ui.draw.text((50, 100), "Erased", font=ui.font_xl, fill="white")
-    ui.fb.update(ui.canvas)
-    time.sleep(1)
+    _draw_center_message(ui, "Erased")
 
 # --- SUBMENUS ---
 
@@ -159,10 +166,12 @@ def run_contact_options(ui, contact, header_root):
         if sel == -1: return
 
         if sel == 0: # Call
-            ui.draw.rectangle((0,0,240,210), fill="black")
-            ui.draw.text((10, 80), "Calling...", font=ui.font_xl, fill="white")
-            ui.draw.text((10, 115), contact[1], font=ui.font_n, fill="white")
-            ui.draw.text((10, 140), contact[2], font=ui.font_s, fill="white")
+            screen_w, _, content_bottom = _screen_metrics(ui)
+            ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+            y = max(12, int(content_bottom * 0.30))
+            ui.draw.text((10, y), "Calling...", font=ui.font_xl, fill="white")
+            ui.draw.text((10, y + 35), contact[1], font=ui.font_n, fill="white")
+            ui.draw.text((10, y + 60), contact[2], font=ui.font_s, fill="white")
             ui.fb.update(ui.canvas)
             time.sleep(2)
             
@@ -175,10 +184,7 @@ def run_contact_options(ui, contact, header_root):
             return # Must return because contact is gone!
 
         elif sel == 3: # Send Number
-            ui.draw.rectangle((0,0,240,210), fill="black")
-            ui.draw.text((50, 100), "Sent!", font=ui.font_xl, fill="white")
-            ui.fb.update(ui.canvas)
-            time.sleep(1)
+            _draw_center_message(ui, "Sent!")
 
 def run_options_submenu(ui):
     opt_items = ["Type of view", "Memory status"]

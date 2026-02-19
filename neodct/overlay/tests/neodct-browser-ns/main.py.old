@@ -4,6 +4,7 @@ import os
 import sys
 import logging
 import time
+import cairo
 
 # -------------------------------------------------------------------------
 # LOGGING SETUP
@@ -42,8 +43,9 @@ else:
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
 
-from gi.repository import Gtk, WebKit2, Gdk, GLib, GdkPixbuf, Pango
+from gi.repository import Gtk, WebKit2, Gdk, GLib, GdkPixbuf, Pango, PangoCairo
 
 WIDTH  = 240
 HEIGHT = 240
@@ -55,7 +57,6 @@ SOFTKEY_HEIGHT = 30 # Nokia style bottom bar
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 HOME_PAGE = os.path.join(ASSETS_DIR, "html", "homepage.html")
-ERROR_PAGE = os.path.join(ASSETS_DIR, "html", "error.html") # Path to error template
 DEFAULT_URL = f"file://{HOME_PAGE}"
 
 NEODCT_FONT_FAMILY = "Nokia Cellphone FC" 
@@ -80,11 +81,6 @@ def load_local_fonts():
     font_path = os.path.join(ASSETS_DIR, "fonts", "font.ttf")
     if os.path.exists(font_path):
         try:
-            # We import PangoCairo only locally here if needed for font loading, 
-            # but mainly we rely on CSS/GTK defaults now. 
-            # If PangoCairo is broken, this might fail, but it's try-excepted.
-            gi.require_version("PangoCairo", "1.0")
-            from gi.repository import PangoCairo
             fontmap = PangoCairo.FontMap.get_default()
             fontmap.add_font_file(font_path)
             logging.info(f"Loaded custom font: {font_path}")
@@ -100,10 +96,9 @@ def apply_neodct_theme():
         background: #000;
         color: #fff;
         font-family: "{NEODCT_FONT_FAMILY}", monospace;
-        font-size: 14px; /* Global Bump (was 12px) */
+        font-size: 12px;
     }}
     window {{ background: #000; }}
-    
     .neodct-urlbar {{
         background: #000;
         border-bottom: 1px solid #fff;
@@ -121,7 +116,6 @@ def apply_neodct_theme():
     }}
     entry.neodct-url:focus {{ box-shadow: none; outline: none; }}
     entry.neodct-url selection {{ background-color: #fff; color: #000; }}
-    
     button.neodct-close {{
         background: #000;
         color: #fff;
@@ -131,55 +125,23 @@ def apply_neodct_theme():
         min-height: 18px;
         min-width: 18px;
     }}
-    
     .neodct-status {{
         background: #000;
         border-top: 1px solid #fff;
         padding: 0px;
     }}
-    label.neodct-status-text {{ color: #fff; font-size: 12px; }}
+    label.neodct-status-text {{ color: #fff; font-size: 11px; }}
     
     /* INPUT POPUP SPECIFIC */
     .neodct-input-box {{
         margin: 10px;
         border: 1px solid #fff;
         padding: 5px;
-        font-size: 16px; /* Bumped to match Pango 12pt */
+        font-size: 14px;
     }}
     .neodct-t9-hint {{
         color: #888;
         margin-top: 5px;
-        font-size: 12px;
-    }}
-
-    /* MENU WIDGET STYLES */
-    .neodct-menu-bg {{
-        background-color: #000;
-    }}
-    .neodct-menu-header {{
-        border-bottom: 1px solid #fff;
-        padding: 5px;
-        font-size: 18px; /* Bumped to match Pango 14pt */
-        background-color: #000;
-        color: #fff;
-    }}
-    .neodct-menu-item {{
-        padding: 12px 10px;
-        color: #fff;
-        background-color: #000;
-        font-size: 16px; /* Bumped to match Pango 12pt */
-    }}
-    .neodct-menu-item-selected {{
-        background-color: #fff;
-        color: #000;
-    }}
-    
-    /* SOFTKEY BAR */
-    .neodct-softkey {{
-        background-color: #000;
-        color: #fff;
-        padding-bottom: 5px; 
-        font-size: 16px; /* Explicit bump */
     }}
     """
     provider = Gtk.CssProvider()
@@ -189,122 +151,74 @@ def apply_neodct_theme():
     )
 
 # -------------------------------------------------------------------------
-# MENU WIDGETS (Refactored to use Standard Widgets - No Cairo)
+# MENU WIDGETS
 # -------------------------------------------------------------------------
+class HeaderWidget:
+    def __init__(self, title):
+        self.title = title
 
-class SoftKeyBarWidget(Gtk.Box):
-    def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        self.set_size_request(WIDTH, SOFTKEY_HEIGHT)
-        self.get_style_context().add_class("neodct-softkey")
+    def draw(self, cr, width):
+        cr.set_source_rgb(0, 0, 0)
+        cr.rectangle(0, 0, width, 35)
+        cr.fill()
+
+        layout = PangoCairo.create_layout(cr)
+        # Fallback to Monospace if Nokia font fails
+        layout.set_font_description(Pango.FontDescription(f"{NEODCT_FONT_FAMILY}, Monospace 14"))
+        layout.set_text(self.title, -1)
         
-        self.label = Gtk.Label()
-        self.label.set_alignment(0.5, 0.5) # Center
-        self.pack_start(self.label, True, True, 0)
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(5, 5)
+        PangoCairo.show_layout(cr, layout)
+
+class SoftKeyBarWidget(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.height = SOFTKEY_HEIGHT
+        self.set_size_request(WIDTH, self.height)
+        self.text = None
+        self.connect("draw", self.on_draw)
 
     def set_text(self, text):
-        self.label.set_text(text)
+        self.text = text
+        self.queue_draw() # Trigger repaint
 
-class VerticalListWidget(Gtk.Box):
-    def __init__(self, parent_window, title, items, callback):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        self.set_size_request(WIDTH, HEIGHT)
-        self.get_style_context().add_class("neodct-menu-bg")
-        
-        self.parent_window = parent_window
-        self.items = items
-        self.title = title
-        self.callback = callback 
-        
-        # State
-        self.selected_index = 0
-        self.window_start = 0
-        self.max_lines = 3
-        
-        # 1. Header
-        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        header_box.get_style_context().add_class("neodct-menu-header")
-        header_box.set_size_request(WIDTH, 35)
-        
-        self.header_label = Gtk.Label(label=title)
-        self.header_label.set_alignment(0.0, 0.5)
-        self.header_label.set_padding(5, 0)
-        header_box.pack_start(self.header_label, True, True, 0)
-        self.pack_start(header_box, False, False, 0)
+    def on_draw(self, widget, cr):
+        # Clear background (Black)
+        cr.set_source_rgb(0, 0, 0)
+        cr.rectangle(0, 0, WIDTH, self.height)
+        cr.fill()
 
-        # 2. List Items Container
-        self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.pack_start(self.list_box, True, True, 0)
-        
-        # Create reusable labels for the visible slots
-        self.row_widgets = []
-        for i in range(self.max_lines):
-            lbl = Gtk.Label()
-            lbl.set_alignment(0.0, 0.5)
-            lbl.set_padding(10, 0)
-            lbl.get_style_context().add_class("neodct-menu-item")
-            # Fixed height to match original look approx
-            lbl.set_size_request(WIDTH, 50) 
+        if self.text:
+            layout = PangoCairo.create_layout(cr)
+            # Fallback to Monospace
+            layout.set_font_description(Pango.FontDescription(f"{NEODCT_FONT_FAMILY}, Monospace 12"))
+            layout.set_text(self.text, -1)
             
-            self.list_box.pack_start(lbl, False, False, 0)
-            self.row_widgets.append(lbl)
-
-        # 3. Simple Scroll Indicator (Optional, using a basic separator for now)
-        # Replacing the drawing logic with a simple spacer if needed
-        
-        self.refresh_view()
-
-    def refresh_view(self):
-        for i in range(self.max_lines):
-            item_idx = self.window_start + i
-            widget = self.row_widgets[i]
+            # Center text
+            _, logical_rect = layout.get_pixel_extents()
+            text_w = logical_rect.width
+            text_h = logical_rect.height
             
-            if item_idx < len(self.items):
-                widget.set_text(self.items[item_idx])
-                widget.set_visible(True)
-                
-                # Handle Selection Style
-                ctx = widget.get_style_context()
-                if item_idx == self.selected_index:
-                    ctx.add_class("neodct-menu-item-selected")
-                else:
-                    ctx.remove_class("neodct-menu-item-selected")
-            else:
-                widget.set_visible(False)
+            x = (WIDTH - text_w) / 2
+            y = (self.height - text_h) / 2
+            
+            cr.set_source_rgb(1, 1, 1) # White
+            cr.move_to(x, y)
+            PangoCairo.show_layout(cr, layout)
 
-    def navigate(self, direction):
-        if direction == "DOWN":
-            if self.selected_index < len(self.items) - 1:
-                self.selected_index += 1
-                if self.selected_index >= self.window_start + self.max_lines:
-                    self.window_start += 1
-                self.refresh_view()
-        elif direction == "UP":
-            if self.selected_index > 0:
-                self.selected_index -= 1
-                if self.selected_index < self.window_start:
-                    self.window_start -= 1
-                self.refresh_view()
-        elif direction == "SELECT":
-            self.callback(self.items[self.selected_index])
-
+# --- NEW: INPUT POPUP WIDGET ---
 class InputPopupWidget(Gtk.Box):
     def __init__(self, callback):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.callback = callback
-        # Background block
-        self.get_style_context().add_class("neodct-menu-bg") 
         
-        # 1. Header
-        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        header_box.get_style_context().add_class("neodct-menu-header")
-        header_box.set_size_request(WIDTH, 35)
-        
-        lbl = Gtk.Label(label="Input Text")
-        lbl.set_alignment(0.0, 0.5)
-        lbl.set_padding(5, 0)
-        header_box.pack_start(lbl, True, True, 0)
-        self.pack_start(header_box, False, False, 0)
+        # 1. Header (Wrapped in DrawingArea)
+        self.header_logic = HeaderWidget("Input Text")
+        self.header_area = Gtk.DrawingArea()
+        self.header_area.set_size_request(WIDTH, 35)
+        self.header_area.connect("draw", self.on_header_draw)
+        self.pack_start(self.header_area, False, False, 0)
         
         # 2. Input Field
         self.entry = Gtk.Entry()
@@ -319,6 +233,9 @@ class InputPopupWidget(Gtk.Box):
         self.t9_label.get_style_context().add_class("neodct-t9-hint")
         self.pack_end(self.t9_label, False, False, 40) # Padding from bottom
         
+    def on_header_draw(self, widget, cr):
+        self.header_logic.draw(cr, WIDTH)
+        
     def open(self, existing_text=""):
         self.entry.set_text(existing_text)
         self.entry.grab_focus()
@@ -329,6 +246,107 @@ class InputPopupWidget(Gtk.Box):
         text = self.entry.get_text()
         self.set_visible(False)
         return text
+
+class VerticalListWidget(Gtk.DrawingArea):
+    def __init__(self, parent_window, title, items, callback):
+        super().__init__()
+        self.parent_window = parent_window
+        self.items = items
+        self.title = title
+        self.callback = callback 
+        
+        self.header = HeaderWidget(title)
+        
+        self.selected_index = 0
+        self.window_start = 0
+        self.max_lines = 3
+        
+        self.list_y_start = 45
+        self.line_height = 55
+        self.list_width = 225
+        
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, widget, cr):
+        cr.set_source_rgb(0, 0, 0)
+        cr.rectangle(0, 0, WIDTH, HEIGHT)
+        cr.fill()
+
+        self.header.draw(cr, WIDTH)
+
+        cr.set_source_rgb(1, 1, 1)
+        cr.set_line_width(1)
+        cr.move_to(0, 35)
+        cr.line_to(WIDTH, 35)
+        cr.stroke()
+
+        for i in range(self.max_lines):
+            item_idx = self.window_start + i
+            if item_idx >= len(self.items): break
+
+            y = self.list_y_start + (i * self.line_height)
+            item_text = self.items[item_idx]
+
+            if item_idx == self.selected_index:
+                cr.set_source_rgb(1, 1, 1)
+                cr.rectangle(0, y, self.list_width, 50)
+                cr.fill()
+                text_color = (0, 0, 0)
+            else:
+                text_color = (1, 1, 1)
+
+            layout = PangoCairo.create_layout(cr)
+            # Fallback to Monospace
+            layout.set_font_description(Pango.FontDescription(f"{NEODCT_FONT_FAMILY}, Monospace 12"))
+            layout.set_text(item_text, -1)
+            
+            _, logical_rect = layout.get_pixel_extents()
+            text_h = logical_rect.height
+            text_y = y + (50 - text_h) / 2 
+
+            cr.set_source_rgb(*text_color)
+            cr.move_to(10, text_y)
+            PangoCairo.show_layout(cr, layout)
+
+        self.draw_scrollbar(cr)
+
+    def draw_scrollbar(self, cr):
+        draw_height = HEIGHT - SOFTKEY_HEIGHT 
+        
+        bar_x = 235
+        cr.set_source_rgb(0.5, 0.5, 0.5)
+        cr.set_line_width(1)
+        cr.move_to(bar_x, 45)
+        cr.line_to(bar_x, draw_height - 5)
+        cr.stroke()
+
+        track_h = (draw_height - 5) - 45
+        
+        if len(self.items) > 1:
+            step = track_h / (len(self.items) - 1)
+            notch_y = 45 + (self.selected_index * step)
+        else:
+            notch_y = 45
+
+        cr.set_source_rgb(1, 1, 1)
+        cr.rectangle(bar_x - 3, notch_y - 3, 6, 6)
+        cr.fill()
+
+    def navigate(self, direction):
+        if direction == "DOWN":
+            if self.selected_index < len(self.items) - 1:
+                self.selected_index += 1
+                if self.selected_index >= self.window_start + self.max_lines:
+                    self.window_start += 1
+                self.queue_draw()
+        elif direction == "UP":
+            if self.selected_index > 0:
+                self.selected_index -= 1
+                if self.selected_index < self.window_start:
+                    self.window_start -= 1
+                self.queue_draw()
+        elif direction == "SELECT":
+            self.callback(self.items[self.selected_index])
 
 # -------------------------------------------------------------------------
 # MAIN BROWSER WINDOW
@@ -428,52 +446,6 @@ class NeoDCTBrowser(Gtk.Window):
         self.set_signal_level(self._sig_level)
 
         self.content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        # ---------------------------------------------------------------------
-        # CRITICAL MEMORY OPTIMIZATIONS
-        # ---------------------------------------------------------------------
-        # 1. Get the global WebContext
-        ctx = WebKit2.WebContext.get_default()
-
-        # 2. Force Single Web Process
-        # Prevents WebKit from spawning multiple 50MB processes for different domains.
-        ctx.set_web_process_count_limit(1)
-        
-        # 3. Set Cache Model to "Document Viewer"
-        # This disables the "Page Cache" (Back/Forward cache) to save massive RAM.
-        ctx.set_cache_model(WebKit2.CacheModel.DOCUMENT_VIEWER)
-
-        # 4. Configure Memory Pressure Settings
-        # This tells WebKit to run the Garbage Collector AGGRESSIVELY.
-        try:
-            mem_settings = WebKit2.MemoryPressureSettings.new()
-            # Set limit to 256MB. If it hits this, it starts killing cached resources.
-            mem_settings.set_memory_limit(256) 
-            mem_settings.set_poll_interval(1.0) # Check every second
-            mem_settings.set_kill_threshold(0.90) # Kill process if it hits 90% of 256MB
-            ctx.set_memory_pressure_settings(mem_settings)
-            logging.info("Memory Pressure Settings Applied: Limit 256MB")
-        except Exception as e:
-            logging.warning(f"Could not set Memory Pressure (Check WebKit ver): {e}")
-
-        # 5. Inject CSS to hide heavy elements (Video/Ads) so they don't render
-        # This saves texture memory.
-        css_bloat_block = """
-            video, audio, object, embed, canvas { display: none !important; }
-            /* Hide common sticky headers that eat screen space and RAM */
-            header, nav, footer { position: static !important; } 
-            /* Disable heavy animations */
-            * { animation: none !important; transition: none !important; }
-        """
-        user_manager = ctx.get_user_content_manager() # Use the context's manager
-        style_sheet = WebKit2.UserStyleSheet(
-            css_bloat_block, 
-            WebKit2.UserContentInjectedFrames.ALL_FRAMES,
-            WebKit2.UserStyleLevel.USER,
-            None, None
-        )
-        user_manager.add_style_sheet(style_sheet)
-        
-        # ---------------------------------------------------------------------
         root.pack_start(self.content_box, True, True, 0)
 
         self.webview = WebKit2.WebView()
@@ -486,9 +458,7 @@ class NeoDCTBrowser(Gtk.Window):
         self.webview.connect("load-changed", self.on_load_changed)
         self.webview.connect("load-failed", self.on_load_failed)
         self.webview.connect("notify::estimated-load-progress", self.on_progress_changed)
-        self.webview.connect("mouse-target-changed", self.on_mouse_target_changed)
-        self.webview.connect("decide-policy", self.on_decide_policy) # NEW: Handle downloads
-        self.webview.connect("load-failed-with-tls-errors", self.on_load_failed_with_tls_errors) # NEW: Handle TLS
+        self.webview.connect("mouse-target-changed", self.on_mouse_target_changed) 
 
         self.content_box.pack_start(self.webview, True, True, 0)
 
@@ -519,47 +489,6 @@ class NeoDCTBrowser(Gtk.Window):
         alloc = widget.get_allocation()
         logging.info(f"Window Realized with Size: {alloc.width}x{alloc.height}")
 
-    # --- DOWNLOAD / POLICY HANDLER ---
-    def on_decide_policy(self, webview, decision, decision_type):
-        if decision_type == WebKit2.PolicyDecisionType.RESPONSE:
-            # Check if this response is something WebKit can't display (likely a download)
-            if not decision.is_mime_type_supported():
-                logging.info("Download detected! Blocking.")
-                decision.ignore() # Stop the download
-                self.show_error_page("Download Error", "File downloads are currently not supported.")
-                return True # We handled it
-        return False # Let WebKit handle normal pages
-
-    def show_error_page(self, title, message):
-        if os.path.exists(ERROR_PAGE):
-            try:
-                with open(ERROR_PAGE, "r") as f:
-                    template = f.read()
-                
-                # Simple templating
-                html = template.replace("{title}", title).replace("{message}", message)
-                
-                # Load with base URI so CSS/Icons (if external) would work
-                self.webview.load_html(html, f"file://{ERROR_PAGE}")
-            except Exception as e:
-                logging.error(f"Failed to load error template: {e}")
-                self.set_status("Critical Error")
-        else:
-            # Fallback if template missing
-            self.webview.load_html(f"<h1>{title}</h1><p>{message}</p>", "about:error")
-
-    def on_load_failed(self, w, ev, f_uri, err):
-        msg = err.message if err else "Unknown Error"
-        logging.error(f"Load Failed for {f_uri}: {msg}")
-        self.show_error_page("Load Error", msg)
-        return True # IMPORTANT: Suppress default error page
-
-    def on_load_failed_with_tls_errors(self, webview, failing_uri, certificate, errors):
-        logging.error(f"TLS Error for {failing_uri}: {errors}")
-        self.show_error_page("Security Error", "Unacceptable TLS Certificate")
-        return True # IMPORTANT: Suppress default error page
-
-    # --- INPUT/MENU LOGIC --- (Kept same as before)
     def on_mouse_target_changed(self, webview, hit_test_result, modifiers):
         if hit_test_result.context_is_editable():
             if not self.is_hovering_input:
@@ -618,40 +547,16 @@ class NeoDCTBrowser(Gtk.Window):
         # (This assumes the element still has focus, which it usually does)
         # We sanitize the input for JS
         safe_text = text.replace("'", "\\'").replace('"', '\\"')
-        
-        # Updated: Inject value AND simulate ENTER keypress to submit searches
         script = f"""
         var el = document.activeElement;
         if(el && (el.tagName == 'INPUT' || el.tagName == 'TEXTAREA')) {{
             el.value = "{safe_text}";
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            
-            // Only submit if it's an INPUT field (searches, etc)
-            // But we also check if it's inside a FORM, in which case direct submit is safest
-            if (el.form) {{
-                el.form.submit();
-            }} else if (el.tagName == 'INPUT') {{
-                // Fallback for JS-driven inputs without a FORM tag
-                var ev = new KeyboardEvent('keydown', {{
-                    bubbles: true, cancelable: true, keyCode: 13, which: 13, key: 'Enter'
-                }});
-                el.dispatchEvent(ev);
-                
-                var ev2 = new KeyboardEvent('keypress', {{
-                    bubbles: true, cancelable: true, keyCode: 13, which: 13, key: 'Enter'
-                }});
-                el.dispatchEvent(ev2);
-                
-                var ev3 = new KeyboardEvent('keyup', {{
-                    bubbles: true, cancelable: true, keyCode: 13, which: 13, key: 'Enter'
-                }});
-                el.dispatchEvent(ev3);
-            }}
+            el.dispatchEvent(new Event('input'));
+            el.dispatchEvent(new Event('change'));
         }}
         """
         self.webview.run_javascript(script, None, None, None)
-        logging.info(f"Injected text and simulated Enter: {text}")
+        logging.info(f"Injected text: {text}")
 
     def toggle_menu(self):
         self.menu_visible = not self.menu_visible
@@ -662,8 +567,7 @@ class NeoDCTBrowser(Gtk.Window):
             self.menu_widget.grab_focus() 
             self.menu_widget.selected_index = 0
             self.menu_widget.window_start = 0
-            # Removed queue_draw() as standard widgets handle their own redraws
-            # self.menu_widget.queue_draw()
+            self.menu_widget.queue_draw()
             logging.info("Menu Opened")
         else:
             self.menu_widget.set_visible(False)
@@ -885,15 +789,11 @@ class NeoDCTBrowser(Gtk.Window):
             self.set_status_transferring(w.get_uri() or self._last_uri, pct=int(p*100))
 
     def on_load_failed(self, w, ev, f_uri, err):
-        msg = err.message if err else "Unknown Error"
-        logging.error(f"Load Failed for {f_uri}: {msg}")
-        self.show_error_page("Load Error", msg)
-        return True # IMPORTANT: Suppress default error page
+        self.show_status_bar(); self.set_status(f"Error loading {host_from_url(f_uri or w.get_uri())}")
+        self.hide_status_bar_after(3.0)
 
-    def on_load_failed_with_tls_errors(self, webview, failing_uri, certificate, errors):
-        logging.error(f"TLS Error for {failing_uri}: {errors}")
-        self.show_error_page("Security Error", "Unacceptable TLS Certificate")
-        return True # IMPORTANT: Suppress default error page
+    def scroll_page(self, dx, dy):
+        self.webview.run_javascript(f"window.scrollBy({dx}, {dy});", None, None, None)
 
     # -----------------------
     # MASTER INPUT CONTROLLER

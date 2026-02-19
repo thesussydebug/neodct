@@ -5,6 +5,32 @@ import os
 import math
 import time
 
+DEFAULT_UI_W = 300
+DEFAULT_UI_H = 172
+DEFAULT_SOFTKEY_H = 30
+APP_SELECTOR_ICON_MAX = 172
+
+
+def _ui_width(ui):
+    return int(getattr(ui, "W", DEFAULT_UI_W))
+
+
+def _ui_height(ui):
+    return int(getattr(ui, "H", DEFAULT_UI_H))
+
+
+def _softkey_height(ui):
+    return int(getattr(ui, "SOFTKEY_H", DEFAULT_SOFTKEY_H))
+
+
+def _content_bottom(ui):
+    return _ui_height(ui) - _softkey_height(ui)
+
+
+def _header_divider_y(ui):
+    return max(30, int(_ui_height(ui) * 0.11))
+
+
 class AppSelector:
     def __init__(self, title, items, ui, background=None):
         self.title = title
@@ -14,62 +40,91 @@ class AppSelector:
         self.selected_index = 0
         
     def draw(self):
+        screen_w = _ui_width(self.ui)
+        screen_h = _ui_height(self.ui)
+        softkey_h = _softkey_height(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        header_y = _header_divider_y(self.ui)
+
         # 1. Background
         if self.background:
             self.ui.canvas.paste(self.background, (0, 0))
         else:
-            self.ui.draw.rectangle((0, 0, 240, 240), fill="black")
+            self.ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
         
         if not self.items:
-            self.ui.draw.text((80, 100), "No Apps", font=self.ui.font_n, fill="white")
+            text = "No Apps"
+            w, h = self.ui.get_text_size(text, self.ui.font_n)
+            y = max(header_y, header_y + ((content_bottom - header_y - h) // 2))
+            self.ui.draw.text(((screen_w - w) // 2, y), text, font=self.ui.font_n, fill="white")
             self.ui.fb.update(self.ui.canvas)
             return
 
         current_app = self.items[self.selected_index]
         
-        # 2. Draw Header (App Name) - Centered, Large
+        # 2. Draw Header (App Name) - Centered, Medium
         name = current_app["name"]
         w, h = self.ui.get_text_size(name, self.ui.font_xl)
-        self.ui.draw.text(((240 - w)//2, 40), name, font=self.ui.font_xl, fill="white")
+        title_y = header_y - 16
+        self.ui.draw.text(((screen_w - w)//2, title_y), name, font=self.ui.font_xl, fill="white")
         
         # 3. Draw Icon (Centered)
         icon_path = current_app.get("icon")
+        icon_y = header_y + max(24, int((content_bottom - header_y) * 0.22))
         if icon_path:
+            icon_cap = min(APP_SELECTOR_ICON_MAX, max(24, content_bottom - icon_y - 8))
             img = self.ui.get_image(icon_path)
             if img:
-                ix = (240 - img.width) // 2
-                iy = 90 
+                draw_img = img
+                if img.width > icon_cap or img.height > icon_cap:
+                    draw_img = img.copy()
+                    draw_img.thumbnail((icon_cap, icon_cap))
+
+                ix = (screen_w - draw_img.width) // 2
+                iy = icon_y
                 # If we have a background, we need to paste the icon using its alpha mask
                 # otherwise transparent pixels will be black if 'img' is just RGB
                 if self.background:
-                    self.ui.canvas.paste(img, (ix, iy), img)
+                    self.ui.canvas.paste(draw_img, (ix, iy), draw_img)
                 else:
-                    self.ui.canvas.paste(img, (ix, iy), img)
+                    self.ui.canvas.paste(draw_img, (ix, iy), draw_img)
             else:
-                self.ui.draw.rectangle((95, 90, 145, 140), outline="white")
-                self.ui.draw.text((105, 105), "?", font=self.ui.font_xl, fill="white")
+                placeholder_size = icon_cap
+                px = (screen_w - placeholder_size) // 2
+                py = icon_y
+                self.ui.draw.rectangle((px, py, px + placeholder_size, py + placeholder_size), outline="white")
+                qw, qh = self.ui.get_text_size("?", self.ui.font_xl)
+                self.ui.draw.text(
+                    (px + (placeholder_size - qw) // 2, py + (placeholder_size - qh) // 2),
+                    "?",
+                    font=self.ui.font_xl,
+                    fill="white",
+                )
 
         # 4. Draw Footer "Select"
         w, h = self.ui.get_text_size("Select", self.ui.font_n)
-        self.ui.draw.text(((240 - w)//2, 210), "Select", font=self.ui.font_n, fill="white")
+        footer_y = content_bottom + max(0, (softkey_h - h) // 2)
+        self.ui.draw.text(((screen_w - w)//2, footer_y), "Select", font=self.ui.font_n, fill="white")
 
         # 5. Draw "Nokia Style" Scrollbar (Right Edge)
-        bar_x = 230
-        self.ui.draw.line((bar_x, 40, bar_x, 200), fill="white", width=2)
+        bar_x = screen_w - 8
+        track_top = header_y + 6
+        track_bottom = max(track_top, content_bottom - 10)
+        self.ui.draw.line((bar_x, track_top, bar_x, track_bottom), fill="white", width=2)
         
         # Calculate Notch Position
         if len(self.items) > 1:
-            step = 160 / (len(self.items) - 1)
-            notch_y = 40 + (self.selected_index * step)
+            step = (track_bottom - track_top) / (len(self.items) - 1)
+            notch_y = track_top + (self.selected_index * step)
         else:
-            notch_y = 40
+            notch_y = track_top
             
         self.ui.draw.rectangle((bar_x - 4, notch_y - 3, bar_x + 2, notch_y + 3), fill="white")
         
         # Optional: Draw Page Number "4"
         page_num = str(self.selected_index + 1)
         w, h = self.ui.get_text_size(page_num, self.ui.font_n)
-        self.ui.draw.text((220, 10), page_num, font=self.ui.font_n, fill="white")
+        self.ui.draw.text((screen_w - 5 - w, 10), page_num, font=self.ui.font_n, fill="white")
 
         self.ui.fb.update(self.ui.canvas)
 
@@ -112,8 +167,8 @@ The SoftKeyBar class defines and aims to replicate the middle navigation button 
 class SoftKeyBar:
     def __init__(self, ui):
         self.ui = ui
-        self.height = 30
-        self.y_start = 240 - self.height
+        self.height = _softkey_height(ui)
+        self.y_start = _ui_height(ui) - self.height
         self.current_text = None
         
         # --- ROBUST TRANSPARENCY CHECK ---
@@ -130,25 +185,27 @@ class SoftKeyBar:
         self.is_transparent = not hasattr(ui, 'softkey')
 
     def update(self, new_text, present=True):
+        screen_w = _ui_width(self.ui)
+        screen_h = _ui_height(self.ui)
         wallpaper = getattr(self.ui, "wallpaper", None)
         
         if self.is_transparent and wallpaper:
             # TRANSPARENT MODE (Home Screen only)
             # Crop the bottom strip from the wallpaper and paste it
-            box = (0, self.y_start, 240, 240)
+            box = (0, self.y_start, screen_w, screen_h)
             try:
                 bg_slice = wallpaper.crop(box)
                 self.ui.canvas.paste(bg_slice, box)
             except Exception:
-                self.ui.draw.rectangle((0, self.y_start, 240, 240), fill="black")
+                self.ui.draw.rectangle((0, self.y_start, screen_w, screen_h), fill="black")
         else:
             # OPAQUE MODE (Apps, Dialogs, Lists)
             # Always draw black to cover scrolling lists or game graphics
-            self.ui.draw.rectangle((0, self.y_start, 240, 240), fill="black")
+            self.ui.draw.rectangle((0, self.y_start, screen_w, screen_h), fill="black")
 
         if new_text:
             w, h = self.ui.get_text_size(new_text, self.ui.font_n)
-            x = (240 - w) // 2
+            x = (screen_w - w) // 2
             y = self.y_start + ((self.height - h) // 2)
             self.ui.draw.text((x, y), new_text, font=self.ui.font_n, fill="white")
 
@@ -179,7 +236,7 @@ class HeaderWidget:
             text = f"{self.root_id}"
             
         w, h = self.ui.get_text_size(text, self.ui.font_n)
-        x = 235 - w
+        x = _ui_width(self.ui) - 5 - w
         y = 5 
         self.ui.draw.text((x, y), text, font=self.ui.font_n, fill="white")
 
@@ -199,22 +256,41 @@ class VerticalList:
         self.header = HeaderWidget(ui, app_id)
         self.selected_index = 0
         self.window_start = 0
-        self.max_lines = 3 # We can fit 3 items comfortably below the title
+        self.max_lines = 3
         
     def draw(self):
+        screen_w = _ui_width(self.ui)
+        screen_h = _ui_height(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        header_y = _header_divider_y(self.ui)
+
         # 1. Clear Screen
-        self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
+        self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
         
         # 2. Draw Title and Header
-        self.ui.draw.text((5, 5), self.title, font=self.ui.font_xl, fill="white")
+        self.ui.draw.text((5, 0), self.title, font=self.ui.font_xl, fill="white")
         self.header.draw(self.selected_index + 1)
         
         # 3. Draw Divider Line
-        self.ui.draw.line((0, 35, 240, 35), fill="white")
+        self.ui.draw.line((0, header_y, screen_w, header_y), fill="white")
 
         # 4. Draw List Items
-        y_start = 45
-        line_height = 55
+        y_start = header_y + 10
+        content_height = max(1, content_bottom - y_start - 4)
+        target_lines = 3
+        line_height = max(28, content_height // target_lines)
+        item_height = max(24, line_height - 4)
+        self.max_lines = min(target_lines, max(1, content_height // line_height))
+        item_font = getattr(self.ui, "font_md", self.ui.font_n)
+
+        if self.selected_index < self.window_start:
+            self.window_start = self.selected_index
+        max_start = max(0, len(self.items) - self.max_lines)
+        if self.window_start > max_start:
+            self.window_start = max_start
+
+        bar_x = screen_w - 5
+        selected_right = max(20, bar_x - 10)
         
         for i in range(self.max_lines):
             item_idx = self.window_start + i
@@ -222,26 +298,28 @@ class VerticalList:
             
             y = y_start + (i * line_height)
             item_text = self.items[item_idx]
+            text_h = self.ui.get_text_size(item_text, item_font)[1]
+            text_y = y + max(0, (item_height - text_h) // 2)
             
             # Draw Selection Box
             if item_idx == self.selected_index:
-                self.ui.draw.rectangle((0, y, 225, y+50), fill="white")
-                self.ui.draw.text((10, y+10), item_text, font=self.ui.font_n, fill="black")
+                self.ui.draw.rectangle((0, y, selected_right, y + item_height), fill="white")
+                self.ui.draw.text((10, text_y), item_text, font=item_font, fill="black")
             else:
-                self.ui.draw.text((10, y+10), item_text, font=self.ui.font_n, fill="white")
+                self.ui.draw.text((10, text_y), item_text, font=item_font, fill="white")
 
         # 5. Draw Scrollbar
-        bar_x = 235
-        self.ui.draw.line((bar_x, 45, bar_x, 205), fill="gray", width=1)
+        track_top = y_start
+        track_bottom = max(track_top, content_bottom - 5)
+        self.ui.draw.line((bar_x, track_top, bar_x, track_bottom), fill="gray", width=1)
         
         if len(self.items) > 1:
-            track_h = 160
-            step = track_h / (len(self.items) - 1)
-            notch_y = 45 + (self.selected_index * step)
+            step = (track_bottom - track_top) / (len(self.items) - 1)
+            notch_y = track_top + (self.selected_index * step)
         else:
-            notch_y = 45
+            notch_y = track_top
             
-        self.ui.draw.rectangle((bar_x - 3, notch_y - 3, bar_x + 3, notch_y + 3), fill="white")
+        self.ui.draw.rectangle((bar_x - 2, notch_y - 3, bar_x + 2, notch_y + 3), fill="white")
 
         # 6. Flush
         self.ui.fb.update(self.ui.canvas)
@@ -303,23 +381,32 @@ class TextInput:
         }
 
     def draw(self, blink_state=True):
+        screen_w = _ui_width(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        header_y = _header_divider_y(self.ui)
+
         # 1. Clear Screen
-        self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
+        self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
         
         # 2. Header
         self.ui.draw.text((5, 5), self.title, font=self.ui.font_xl, fill="white")
-        self.ui.draw.line((0, 35, 240, 35), fill="white")
+        self.ui.draw.line((0, header_y, screen_w, header_y), fill="white")
         
         # 3. Prompt
-        self.ui.draw.text((10, 55), self.prompt, font=self.ui.font_n, fill="white")
+        prompt_y = header_y + 20
+        self.ui.draw.text((10, prompt_y), self.prompt, font=self.ui.font_n, fill="white")
         
         # 4. Input Box Container
-        box_y = 85
-        self.ui.draw.rectangle((10, box_y, 230, box_y + 40), outline="white")
+        box_y = prompt_y + 30
+        box_h = max(24, min(40, content_bottom - box_y - 10))
+        box_right = max(20, screen_w - 10)
+        self.ui.draw.rectangle((10, box_y, box_right, box_y + box_h), outline="white")
         
         # 5. The Text
         display_text = self.text + ("_" if blink_state else "")
-        self.ui.draw.text((15, box_y + 10), display_text, font=self.ui.font_n, fill="white")
+        text_h = self.ui.get_text_size(display_text or "A", self.ui.font_n)[1]
+        text_y = box_y + max(0, (box_h - text_h) // 2)
+        self.ui.draw.text((15, text_y), display_text, font=self.ui.font_n, fill="white")
         
         self.ui.fb.update(self.ui.canvas)
 
@@ -376,8 +463,8 @@ class TextInputLong:
         self.cursor = len(self.text)
         self.on_empty_backspace = on_empty_backspace
         self.font = getattr(ui, "font_s", None) or ui.font_n
-        self.text_area_top = 45
-        self.text_area_bottom = 210
+        self.text_area_top = _header_divider_y(ui) + 10
+        self.text_area_bottom = _content_bottom(ui) - 4
 
         # Development Key Map (PC Keyboard -> Char)
         self.DEV_KEYMAP = {
@@ -452,17 +539,21 @@ class TextInputLong:
     def _current_lines(self, blink_state):
         cursor_marker = "_" if blink_state else ""
         display_text = self.text + cursor_marker
-        return self._wrap_text(display_text, 220)
+        return self._wrap_text(display_text, max(20, _ui_width(self.ui) - 20))
 
     def draw(self, blink_state=True):
-        self.ui.draw.rectangle((0, 0, 240, 210), fill="black")
+        screen_w = _ui_width(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        header_y = _header_divider_y(self.ui)
+
+        self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
 
         # Header
         self.ui.draw.text((5, 5), self.title, font=self.ui.font_xl, fill="white")
         char_count = str(len(self.text))
         w, _ = self.ui.get_text_size(char_count, self.ui.font_n)
-        self.ui.draw.text((235 - w, 5), char_count, font=self.ui.font_n, fill="white")
-        self.ui.draw.line((0, 35, 240, 35), fill="white")
+        self.ui.draw.text((screen_w - 5 - w, 5), char_count, font=self.ui.font_n, fill="white")
+        self.ui.draw.line((0, header_y, screen_w, header_y), fill="white")
 
         lines = self._current_lines(blink_state)
         _, line_h = self.ui.get_text_size("Ag", self.font)
@@ -596,9 +687,12 @@ class MessageDialog:
 
     def _draw(self):
         ui = self.ui
+        screen_w = _ui_width(ui)
+        screen_h = _ui_height(ui)
+        content_bottom = _content_bottom(ui)
 
         # Full clear
-        ui.draw.rectangle((0, 0, 240, 240), fill="black")
+        ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
 
         # Icon (optional)
         icon = None
@@ -621,8 +715,7 @@ class MessageDialog:
             y = self.margin + icon.height + 6
 
         # Body
-        content_bottom = 240 - 30  # SoftKeyBar height
-        max_w = 240 - (self.margin * 2)
+        max_w = screen_w - (self.margin * 2)
         lines = self._wrap_text(self.message, self.font_body, max_w)
 
         line_h = ui.get_text_size("Ag", self.font_body)[1] + 3
@@ -682,10 +775,10 @@ class PagedList:
         self.softkey = SoftKeyBar(ui) if show_select_hint else None
         self._show_select_hint = show_select_hint
 
-        # Layout tuning for 240x240
-        self._content_top = 40     # start of big text area
-        self._content_bottom = 200 # end of big text area
-        self._bar_x = 235          # scrollbar x
+        header_y = _header_divider_y(ui)
+        self._content_top = header_y + 8
+        self._content_bottom = _content_bottom(ui) - 10
+        self._bar_x = _ui_width(ui) - 5
 
     def _get_item_name(self, idx):
         if not self.items:
@@ -752,17 +845,24 @@ class PagedList:
         return lines[:max_lines]
 
     def draw(self):
+        screen_w = _ui_width(self.ui)
+        screen_h = _ui_height(self.ui)
+        header_y = _header_divider_y(self.ui)
+
         # Clear full screen
-        self.ui.draw.rectangle((0, 0, 240, 240), fill="black")
+        self.ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
 
         # Title + divider
         self.ui.draw.text((5, 5), self.title, font=self.ui.font_xl, fill="white")
-        self.ui.draw.line((0, 35, 240, 35), fill="white")
+        self.ui.draw.line((0, header_y, screen_w, header_y), fill="white")
 
         # Empty state
         if not self.items:
             self.header.draw(None)
-            self.ui.draw.text((70, 110), "No Items", font=self.ui.font_n, fill="white")
+            text = "No Items"
+            w, h = self.ui.get_text_size(text, self.ui.font_n)
+            y = self._content_top + max(0, ((self._content_bottom - self._content_top) - h) // 2)
+            self.ui.draw.text(((screen_w - w) // 2, y), text, font=self.ui.font_n, fill="white")
             if self.softkey and self._show_select_hint:
                 self.softkey.update(None, present=False)
             self.ui.fb.update(self.ui.canvas)
@@ -773,7 +873,7 @@ class PagedList:
 
         # Main page text (large, 2-line wrap)
         name = self._get_item_name(self.selected_index)
-        max_w = 210  # leave room for scrollbar
+        max_w = max(20, self._bar_x - 12)
         lines = self._wrap_to_lines(name, self.ui.font_xl, max_w, max_lines=2)
 
         # Vertical placement: visually centered in content area
@@ -788,8 +888,8 @@ class PagedList:
             self.ui.draw.text((x, y), line, font=self.ui.font_xl, fill="white")
 
         # Scrollbar (right edge)
-        track_top = 40
-        track_bottom = 200
+        track_top = self._content_top
+        track_bottom = max(track_top, self._content_bottom)
         self.ui.draw.line((self._bar_x, track_top, self._bar_x, track_bottom), fill="white", width=2)
 
         if len(self.items) > 1:

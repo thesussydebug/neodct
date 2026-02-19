@@ -2,6 +2,10 @@ import subprocess
 import os
 
 def run(ui):
+    screen_w = getattr(ui, "W", 300)
+    screen_h = getattr(ui, "H", 172)
+    content_bottom = getattr(ui, "content_bottom", screen_h - getattr(ui, "SOFTKEY_H", 30))
+
     # 1. Locate the .sh file (Assume it's in the same folder as this main.py)
     # This ensures it works no matter where you move the folder.
     app_path = os.path.dirname(os.path.abspath(__file__))
@@ -9,8 +13,11 @@ def run(ui):
 
     # 2. OPTIONAL: Visual Feedback
     # Clear screen and tell user we are launching external process
-    ui.draw.rectangle((0, 0, 240, 240), fill="black")
-    ui.draw.text((20, 110), "Launching...", font=ui.font_n, fill="white")
+    ui.draw.rectangle((0, 0, screen_w, screen_h), fill="black")
+    text = "Launching..."
+    tw, th = ui.get_text_size(text, ui.font_n)
+    ty = max(10, (content_bottom - th) // 2)
+    ui.draw.text(((screen_w - tw) // 2, ty), text, font=ui.font_n, fill="white")
     ui.fb.update(ui.canvas)
 
     # 3. Permissions Check
