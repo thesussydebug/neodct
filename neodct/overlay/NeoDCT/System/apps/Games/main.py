@@ -32,8 +32,8 @@ class SnakeGame:
         self.ui = ui
         self.softkey = SoftKeyBar(ui)
         self.keypad_fd = None
-        self.screen_w = getattr(ui, "W", 300)
-        self.screen_h = getattr(ui, "H", 172)
+        self.screen_w = getattr(ui, "W", 240)
+        self.screen_h = getattr(ui, "H", 175)
         self.softkey_h = getattr(ui, "SOFTKEY_H", 30)
         self.content_bottom = getattr(ui, "content_bottom", self.screen_h - self.softkey_h)
         self._compute_layout()

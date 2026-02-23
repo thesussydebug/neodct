@@ -27,8 +27,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 FB_PATH = "/dev/fb0"
 KEYPAD_PATH = "/dev/input/event0"
-UI_WIDTH = 300
-UI_HEIGHT = 172
+UI_WIDTH = 240
+UI_HEIGHT = 175
 SOFTKEY_HEIGHT = 30
 WIDTH = UI_WIDTH
 HEIGHT = UI_HEIGHT
@@ -71,7 +71,24 @@ class Framebuffer:
         if self.bpp == 32:
             data = native_img.convert("RGBA").tobytes("raw", "BGRA")
         elif self.bpp == 16:
-            data = native_img.convert("RGB").tobytes("raw", "BGR;16")
+            rgb_img = native_img.convert("RGB")
+            try:
+                # Fast path when Pillow build supports this packer.
+                data = rgb_img.tobytes("raw", "BGR;16")
+            except ValueError:
+                # Fallback for minimal Pillow builds: software-pack RGB565.
+                src = rgb_img.tobytes()
+                out = bytearray((len(src) // 3) * 2)
+                j = 0
+                for i in range(0, len(src), 3):
+                    r = src[i]
+                    g = src[i + 1]
+                    b = src[i + 2]
+                    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                    out[j] = rgb565 & 0xFF
+                    out[j + 1] = (rgb565 >> 8) & 0xFF
+                    j += 2
+                data = bytes(out)
         else:
             data = native_img.convert("RGB").tobytes()
             

@@ -12,8 +12,8 @@ from System.core import main as ui_engine
 
 def show_boot_logo(fb):
     from PIL import Image, ImageDraw, ImageFont
-    screen_w = getattr(ui_engine, "UI_WIDTH", 300)
-    screen_h = getattr(ui_engine, "UI_HEIGHT", 172)
+    screen_w = getattr(ui_engine, "UI_WIDTH", 240)
+    screen_h = getattr(ui_engine, "UI_HEIGHT", 175)
     
     canvas = Image.new("RGB", (screen_w, screen_h), "black")
     draw = ImageDraw.Draw(canvas)

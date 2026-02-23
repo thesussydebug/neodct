@@ -11,8 +11,8 @@ import select
 from System.ui.framework import SoftKeyBar
 
 KEYPAD_PATH = "/dev/input/event0"
-WIDTH = 300
-HEIGHT = 172
+WIDTH = 240
+HEIGHT = 175
 
 
 def _flush_input(fd):

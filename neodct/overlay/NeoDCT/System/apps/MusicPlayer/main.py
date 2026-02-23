@@ -137,8 +137,8 @@ class MusicPlayer:
             self.is_paused = True
 
     def run_now_playing(self, filepath):
-        screen_w = getattr(self.ui, "W", 300)
-        screen_h = getattr(self.ui, "H", 172)
+        screen_w = getattr(self.ui, "W", 240)
+        screen_h = getattr(self.ui, "H", 175)
         softkey_h = getattr(self.ui, "SOFTKEY_H", 30)
         content_bottom = getattr(self.ui, "content_bottom", screen_h - softkey_h)
         header_h = max(24, int(screen_h * 0.08))
@@ -284,11 +284,11 @@ class MusicPlayer:
 
     def run(self):
         while True:
-            screen_w = getattr(self.ui, "W", 300)
+            screen_w = getattr(self.ui, "W", 240)
             content_bottom = getattr(
                 self.ui,
                 "content_bottom",
-                getattr(self.ui, "H", 172) - getattr(self.ui, "SOFTKEY_H", 30),
+                getattr(self.ui, "H", 175) - getattr(self.ui, "SOFTKEY_H", 30),
             )
             self.scan_music()
             if not self.playlist:

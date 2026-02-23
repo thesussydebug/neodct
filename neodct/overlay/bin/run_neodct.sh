@@ -25,9 +25,9 @@ EXIT_CODE=$?
 
 # 5. RE-ENABLE ECHO
 # We MUST do this, or your emergency shell will be invisible!
-stty echo tostop
+#stty echo tostop
 # Re-enable the cursor (\033[?25h)
-printf "\033[?25h"
+#printf "\033[?25h"
 
 # 6. Draw the Crash Screen
 printf "\033[41m\033[1;97m"
@@ -39,12 +39,12 @@ echo "=============================="
 echo " CODE: $EXIT_CODE"
 echo "=============================="
 
-printf "\033[0m"
+#printf "\033[0m"
 
-echo ""
-echo "Just kidding :)"
-echo "Dev Shell Active!"
-echo "------------------------------"
+#echo ""
+#echo "Just kidding :)"
+#echo "Dev Shell Active!"
+#echo "------------------------------"
 
-export PS1="(CRASH)# "
-/bin/sh
+#export PS1="(CRASH)# "
+#/bin/sh

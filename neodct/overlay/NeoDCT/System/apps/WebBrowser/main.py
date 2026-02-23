@@ -2,8 +2,8 @@ import subprocess
 import os
 
 def run(ui):
-    screen_w = getattr(ui, "W", 300)
-    screen_h = getattr(ui, "H", 172)
+    screen_w = getattr(ui, "W", 240)
+    screen_h = getattr(ui, "H", 175)
     content_bottom = getattr(ui, "content_bottom", screen_h - getattr(ui, "SOFTKEY_H", 30))
 
     # 1. Locate the .sh file (Assume it's in the same folder as this main.py)

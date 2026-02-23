@@ -5,10 +5,10 @@ import os
 import math
 import time
 
-DEFAULT_UI_W = 300
-DEFAULT_UI_H = 172
+DEFAULT_UI_W = 240
+DEFAULT_UI_H = 175
 DEFAULT_SOFTKEY_H = 30
-APP_SELECTOR_ICON_MAX = 172
+APP_SELECTOR_ICON_MAX = 175
 
 
 def _ui_width(ui):

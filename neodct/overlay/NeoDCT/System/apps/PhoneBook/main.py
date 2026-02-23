@@ -10,8 +10,8 @@ sys.stderr = sys.stdout
 
 
 def _screen_metrics(ui):
-    screen_w = getattr(ui, "W", 300)
-    screen_h = getattr(ui, "H", 172)
+    screen_w = getattr(ui, "W", 240)
+    screen_h = getattr(ui, "H", 175)
     softkey_h = getattr(ui, "SOFTKEY_H", 30)
     content_bottom = getattr(ui, "content_bottom", screen_h - softkey_h)
     return screen_w, screen_h, content_bottom

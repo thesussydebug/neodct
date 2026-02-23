@@ -1,8 +1,8 @@
 from System.ui.framework import SoftKeyBar, MessageDialog
 
 def run(ui):
-    screen_w = getattr(ui, "W", 300)
-    content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 172) - getattr(ui, "SOFTKEY_H", 30))
+    screen_w = getattr(ui, "W", 240)
+    content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 175) - getattr(ui, "SOFTKEY_H", 30))
 
     # Clear screen
     ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")

@@ -39,8 +39,8 @@ def show_contact_selector(ui, title="Contacts", btn_text="Select", search_query=
     
     # 2. Handle Empty State
     if not contacts:
-        screen_w = getattr(ui, "W", 300)
-        content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 172) - getattr(ui, "SOFTKEY_H", 30))
+        screen_w = getattr(ui, "W", 240)
+        content_bottom = getattr(ui, "content_bottom", getattr(ui, "H", 175) - getattr(ui, "SOFTKEY_H", 30))
         ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
         msg = "No Results" if search_query else "No Contacts"
         
