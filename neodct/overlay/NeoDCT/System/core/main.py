@@ -33,6 +33,7 @@ SOFTKEY_HEIGHT = 30
 WIDTH = UI_WIDTH
 HEIGHT = UI_HEIGHT
 WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
+ENGINEERING_MODE = False
 
 # --- HARDWARE DRIVER ---
 class Framebuffer:
@@ -207,33 +208,40 @@ class NeoDCT_UI:
         self.wallpaper = self.load_wallpaper(wallpaper_path) if wallpaper_path else None
         
         self.apps = []
-        app_dir = "/NeoDCT/System/apps"
-        
-        if not os.path.exists(app_dir):
-            try: os.makedirs(app_dir)
-            except: pass
+        app_dirs = ["/NeoDCT/System/apps"]
+        if ENGINEERING_MODE:
+            app_dirs.append("/NeoDCT/System/engineering/apps")
 
         try:
-            if os.path.exists(app_dir):
-                for folder in os.listdir(app_dir):
-                    manifest_path = f"{app_dir}/{folder}/manifest.json"
-                    if os.path.exists(manifest_path):
-                        try:
-                            with open(manifest_path, "r") as f:
-                                data = json.load(f)
-                                self.apps.append({
-                                    "name": data.get("name", folder),
-                                    "icon": f"{app_dir}/{folder}/" + data.get("icon", "icon.png"),
-                                    "path": f"{app_dir}/{folder}",
-                                    "exec": data.get("exec", "main.py"),
-                                    "id": int(data.get("id", 999)) 
-                                })
-                        except: pass
-            
+            for app_dir in app_dirs:
+                self._scan_apps_from_dir(app_dir)
             self.apps.sort(key=lambda x: x["id"])
-            
         except Exception as e:
             print(f"[OS] App scan error: {e}")
+
+    def _scan_apps_from_dir(self, app_dir):
+        if not os.path.exists(app_dir):
+            try:
+                os.makedirs(app_dir)
+            except:
+                return
+
+        for folder in os.listdir(app_dir):
+            manifest_path = f"{app_dir}/{folder}/manifest.json"
+            if not os.path.exists(manifest_path):
+                continue
+            try:
+                with open(manifest_path, "r") as f:
+                    data = json.load(f)
+                    self.apps.append({
+                        "name": data.get("name", folder),
+                        "icon": f"{app_dir}/{folder}/" + data.get("icon", "icon.png"),
+                        "path": f"{app_dir}/{folder}",
+                        "exec": data.get("exec", "main.py"),
+                        "id": int(data.get("id", 999))
+                    })
+            except:
+                pass
 
     def load_layout(self, path):
         try:

@@ -1,0 +1,6 @@
+{
+    "name": "LCD Test",
+    "id": "9001",
+    "icon": "icon.png",
+    "exec": "main.py"
+}
