@@ -1,6 +1,7 @@
 import math
 import time
 
+from System.ui.framework import SoftKeyBar
 
 EXIT_KEYS = {14, 28, 46, 50}
 
@@ -46,6 +47,7 @@ def run(ui):
 
     center_x = screen_w // 2
     center_y = content_bottom // 2
+    softkey = SoftKeyBar(ui)
 
     # Cube vertices in model space
     size = min(screen_w, content_bottom) * 0.22
@@ -136,8 +138,7 @@ def run(ui):
         hw, hh = ui.get_text_size(hint, ui.font_s)
         ui.draw.text(((screen_w - hw) // 2, content_bottom - hh - 4), hint, font=ui.font_s, fill="gray")
 
-        # Softkey bar
-        if hasattr(ui, "softkey") and ui.softkey:
-            ui.softkey.update("Exit", present=False)
+        # Opaque app-mode softkey bar
+        softkey.update("Exit", present=False)
 
         ui.fb.update(ui.canvas)

@@ -11,6 +11,7 @@ import select
 import json
 import fcntl
 import traceback
+import glob
 # --- THE FIX: Import ImageFile to handle "broken" JPEGs ---
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFile 
 from System.ui.framework import AppSelector, SoftKeyBar
@@ -29,6 +30,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 FB_PATH = "/dev/fb0"
 KEYPAD_PATH = "/dev/input/event0"
+KEYPAD_DEVICE_ENV = "NEODCT_KEYPAD_DEVICE"
 UI_WIDTH = 240
 UI_HEIGHT = 175
 SOFTKEY_HEIGHT = 30
@@ -47,6 +49,61 @@ def _setting_is_enabled(value, default=True):
     if text in ("0", "false", "off", "no", "disabled"):
         return False
     return default
+
+
+def _event_device_name(path):
+    real_path = os.path.realpath(path)
+    event_name = os.path.basename(real_path)
+    sys_name_path = f"/sys/class/input/{event_name}/device/name"
+    try:
+        with open(sys_name_path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "unknown"
+
+
+def _discover_keypad_path():
+    """
+    Pick a keyboard-capable input event device.
+    Order:
+    1) explicit env override
+    2) /dev/input/by-path/*-kbd
+    3) /dev/input/by-id/*-kbd
+    4) legacy /dev/input/event0
+    5) first /dev/input/event*
+    """
+    override = os.environ.get(KEYPAD_DEVICE_ENV, "").strip()
+    if override:
+        if os.path.exists(override):
+            selected = os.path.realpath(override)
+            print(f"[INPUT] Using {KEYPAD_DEVICE_ENV}: {selected} ({_event_device_name(selected)})")
+            return selected
+        print(f"[INPUT] {KEYPAD_DEVICE_ENV} not found: {override}")
+
+    candidates = []
+    candidates.extend(sorted(glob.glob("/dev/input/by-path/*-kbd")))
+    candidates.extend(sorted(glob.glob("/dev/input/by-id/*-kbd")))
+    if os.path.exists(KEYPAD_PATH):
+        candidates.append(KEYPAD_PATH)
+
+    seen = set()
+    for path in candidates:
+        resolved = os.path.realpath(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if os.path.exists(resolved):
+            print(f"[INPUT] Selected keyboard device: {resolved} ({_event_device_name(resolved)})")
+            return resolved
+
+    event_devices = sorted(glob.glob("/dev/input/event*"))
+    if event_devices:
+        fallback = os.path.realpath(event_devices[0])
+        print(f"[INPUT] Fallback input device: {fallback} ({_event_device_name(fallback)})")
+        return fallback
+
+    print(f"[INPUT] No input event device found; defaulting to {KEYPAD_PATH}")
+    return KEYPAD_PATH
 
 # --- HARDWARE DRIVER ---
 class Framebuffer:
@@ -245,7 +302,15 @@ class NeoDCT_UI:
         self.H = UI_HEIGHT
         self.SOFTKEY_H = SOFTKEY_HEIGHT
         self.content_bottom = self.H - self.SOFTKEY_H
-        self.keypad_fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
+        self.keypad_path = _discover_keypad_path()
+        try:
+            self.keypad_fd = os.open(self.keypad_path, os.O_RDONLY | os.O_NONBLOCK)
+        except Exception as e:
+            print(f"[INPUT] Failed opening {self.keypad_path}: {e}")
+            print(f"[INPUT] Falling back to {KEYPAD_PATH}")
+            self.keypad_path = KEYPAD_PATH
+            self.keypad_fd = os.open(self.keypad_path, os.O_RDONLY | os.O_NONBLOCK)
+        print(f"[INPUT] Listening on {self.keypad_path}")
         self.softkey = SoftKeyBar(self)
 
         self.fb = fb_driver

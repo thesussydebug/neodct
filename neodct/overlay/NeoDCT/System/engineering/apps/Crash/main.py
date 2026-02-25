@@ -4,9 +4,10 @@ APP_ID = 9997
 
 
 def run(ui):
+    softkey = SoftKeyBar(ui)
     while True:
         menu = VerticalList(ui, "Crash", ["CRASH!"], app_id=APP_ID)
-        SoftKeyBar(ui).update("Select", present=False)
+        softkey.update("Select", present=False)
         choice = menu.show()
 
         if choice == -1:

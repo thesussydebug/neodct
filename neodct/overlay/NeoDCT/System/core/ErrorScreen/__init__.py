@@ -48,8 +48,7 @@ def show_alpha_security_notice_once(
     """Returns True if the notice was shown, False if it was already acknowledged."""
     if message is None:
         message = (
-            "This is alpha software. There is currently no real security implemented whatsoever and "
-            "all development features are enabled by default. DO NOT STORE SENSITIVE DATA ON THIS DEVICE!!!"
+            "This is alpha software. Consider it extremely insecure and unstable. Don't store important data on this device."
         )
 
     try:
@@ -58,7 +57,7 @@ def show_alpha_security_notice_once(
     except Exception:
         pass
 
-    show_error(ui, message, title="Security warning", icon_path=DEFAULT_WARNING_ICON, button_text="OK")
+    show_error(ui, message, title="Notice", icon_path=DEFAULT_WARNING_ICON, button_text="OK")
 
     # Best-effort persistence.
     try:
