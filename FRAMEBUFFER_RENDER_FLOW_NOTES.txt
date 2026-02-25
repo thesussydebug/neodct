@@ -1,0 +1,72 @@
+NeoDCT Framebuffer Render Flow Notes
+Source analyzed: /home/26acolgan/Documents/neodct/neodct/overlay/NeoDCT/System/core/main.py
+Date: 2026-02-25
+
+1) Device setup and memory mapping
+- FB device path is hardcoded as `/dev/fb0` (`FB_PATH`).
+- `Framebuffer.__init__()`:
+  - Opens fb device read/write (`os.open(FB_PATH, os.O_RDWR)`).
+  - Reads variable screen info via `ioctl(..., 0x4600)` to get:
+    - `xres`, `yres`, `bpp`.
+  - Reads fixed screen info via `ioctl(..., 0x4602)` to get:
+    - `line_length` (stride in bytes).
+  - Computes mapped buffer size: `line_length * yres`.
+  - `mmap`s the framebuffer into userspace (`self.mm`) with shared read/write.
+
+2) UI canvas model (off-screen composition)
+- `NeoDCT_UI.__init__()` creates an off-screen PIL canvas:
+  - `self.canvas = Image.new("RGB", (self.W, self.H), "black")`
+  - `self.draw = ImageDraw.Draw(self.canvas)`
+- UI logical resolution is `240x175`, with 30 px reserved softkey area (`SOFTKEY_HEIGHT`).
+- All app/home/menu rendering draws into this PIL canvas first, not directly to `/dev/fb0`.
+
+3) Per-frame render orchestration
+- Main loop is `run(fb)`:
+  - `while True`:
+    - `ui.update()` renders current state and flushes framebuffer.
+    - reads keypad and handles state transitions.
+- `NeoDCT_UI.update()` drives state-specific rendering:
+  - `HOME`: `render_home()` then `self.fb.update(self.canvas)`
+  - `HOME_DIALING`: `render_home_dialing()` then `self.fb.update(self.canvas)`
+  - `MENU`: runs selector logic; returns to HOME afterward.
+
+4) What gets rendered before flush
+- Home/background path:
+  - If wallpaper exists: paste wallpaper onto canvas.
+  - Else if `ui_home.json` background exists: load + resize + paste.
+  - Else draw solid black background.
+- Then UI elements from JSON are rendered (text, icons, status items).
+- Additional overlays (softkey bar, dialing text, etc.) are drawn on the same canvas.
+
+5) Conversion from PIL canvas to native framebuffer format
+- `Framebuffer.update(pil_image)`:
+  - Creates `native_img` sized to actual framebuffer stride/height:
+    - width = `line_length / bytes_per_pixel`
+    - height = `yres`
+  - Converts source to RGB and center-crops/pastes into `native_img`.
+  - Pixel format conversion by fb bit depth:
+    - 32 bpp: converts to BGRA byte order.
+    - 16 bpp:
+      - fast path: Pillow raw pack `"BGR;16"`.
+      - fallback path: manual software RGB565 packing.
+    - otherwise: raw RGB bytes.
+  - Writes bytes to mapped fb memory:
+    - `self.mm.seek(0)`
+    - `self.mm.write(data[:self.size])`
+
+6) Important behavior/implications
+- Rendering is immediate and synchronous from Python loop; no vsync or double-buffer API usage.
+- The UI can run at non-native logical size because `update()` center-crops/pastes into native fb.
+- 16 bpp fallback ensures compatibility even if Pillow build lacks direct `"BGR;16"` packer.
+- If font loading fails, rendering still works using `ImageFont.load_default()`, but style changes.
+
+7) Practical debugging checkpoints
+- If screen is blank:
+  - verify `/dev/fb0` exists and permissions allow open/mmap.
+  - check `xres/yres/bpp/line_length` read correctly.
+- If colors are wrong:
+  - verify target fb format is 16bpp RGB565 or expected 32bpp BGRA path.
+- If cropped/misaligned:
+  - inspect `UI_WIDTH/UI_HEIGHT` vs native fb resolution and centering logic.
+- If performance issues:
+  - frame loop currently repaints each iteration in Python; measure key loop timing.
