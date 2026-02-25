@@ -6,6 +6,7 @@ from System.core.SettingsStorage import get_setting, set_setting
 ROOT_ID = 4
 WALLPAPER_DIR = "/NeoDCT/User/wallpapers"
 SUPPORTED_WALLPAPERS = (".jpg", ".jpeg")
+ENGINEERING_MODE_KEY = "system.ui.engineering_mode"
 
 
 def _scan_wallpapers():
@@ -74,6 +75,54 @@ def _wrap_text(ui, text, max_width, font):
     return lines
 
 
+def _setting_is_enabled(value, default=True):
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "on", "yes", "enabled"):
+        return True
+    if text in ("0", "false", "off", "no", "disabled"):
+        return False
+    return default
+
+
+def _refresh_engineering_apps(ui, enabled):
+    if not hasattr(ui, "apps"):
+        return
+
+    filtered = [
+        app
+        for app in ui.apps
+        if "/NeoDCT/System/engineering/apps/" not in app.get("path", "")
+    ]
+    ui.apps = filtered
+
+    if enabled and hasattr(ui, "_scan_apps_from_dir"):
+        ui._scan_apps_from_dir("/NeoDCT/System/engineering/apps")
+
+    try:
+        ui.apps.sort(key=lambda item: item["id"])
+    except Exception:
+        pass
+
+
+def _show_engineering_mode(ui):
+    current_enabled = _setting_is_enabled(get_setting(ENGINEERING_MODE_KEY, "ON"), default=True)
+    options = ["On", "Off"]
+    menu = VerticalList(ui, "Eng. Mode", options, app_id=ROOT_ID)
+    menu.selected_index = 0 if current_enabled else 1
+
+    SoftKeyBar(ui).update("Select", present=False)
+    selection = menu.show()
+    if selection == -1:
+        return
+
+    enabled = selection == 0
+    set_setting(ENGINEERING_MODE_KEY, "ON" if enabled else "OFF")
+    _refresh_engineering_apps(ui, enabled)
+    MessageDialog(ui, f"Engineering Mode set to {'ON' if enabled else 'OFF'}.").show()
+
+
 def _show_about(ui):
     title = "NeoDCT"
     screen_w = getattr(ui, "W", 240)
@@ -130,7 +179,7 @@ def _show_about(ui):
 
 def run(ui):
     while True:
-        menu = VerticalList(ui, "Settings", ["Wallpaper", "About"], app_id=ROOT_ID)
+        menu = VerticalList(ui, "Settings", ["Wallpaper", "Engineering Mode", "About"], app_id=ROOT_ID)
         SoftKeyBar(ui).update("Select", present=False)
         selection = menu.show()
         if selection == -1:
@@ -138,4 +187,6 @@ def run(ui):
         if selection == 0:
             _show_wallpaper_menu(ui)
         elif selection == 1:
+            _show_engineering_mode(ui)
+        elif selection == 2:
             _show_about(ui)

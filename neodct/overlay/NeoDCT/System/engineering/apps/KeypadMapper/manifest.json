@@ -1,0 +1,6 @@
+{
+    "name": "KeyMap",
+    "id": "9002",
+    "icon": "icon.png",
+    "exec": "main.py"
+}

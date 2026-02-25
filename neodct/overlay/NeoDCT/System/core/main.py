@@ -33,7 +33,17 @@ SOFTKEY_HEIGHT = 30
 WIDTH = UI_WIDTH
 HEIGHT = UI_HEIGHT
 WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
-ENGINEERING_MODE = True
+
+
+def _setting_is_enabled(value, default=True):
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "on", "yes", "enabled"):
+        return True
+    if text in ("0", "false", "off", "no", "disabled"):
+        return False
+    return default
 
 # --- HARDWARE DRIVER ---
 class Framebuffer:
@@ -52,49 +62,114 @@ class Framebuffer:
 
         self.size = self.line_length * self.yres
         self.mm = mmap.mmap(self.fd, self.size, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+        self.bytes_per_pixel = max(1, self.bpp // 8)
+        self.stride_pixels = self.line_length // self.bytes_per_pixel
+
+        # Initialize framebuffer memory once to black; allows partial-band writes later.
+        self.mm.seek(0)
+        self.mm.write(b"\x00" * self.size)
+
+        # Reuse target buffer/image to avoid per-frame allocations.
+        self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
+        self._black = (0, 0, 0)
+
+        # Cache RGB565 lookup tables for fallback packing.
+        # These reduce Python work inside the hot pixel loop.
+        self._r565 = [(i & 0xF8) << 8 for i in range(256)]
+        self._g565 = [(i & 0xFC) << 3 for i in range(256)]
+        self._b565 = [(i >> 3) for i in range(256)]
+        self._rgb565_out = bytearray(self.size)
+        self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
+
+    def _pack_rgb565(self, src_bytes, out_buf):
+        r565 = self._r565
+        g565 = self._g565
+        b565 = self._b565
+        j = 0
+        # Loop remains Python, but table lookups reduce arithmetic overhead.
+        for i in range(0, len(src_bytes), 3):
+            rgb565 = r565[src_bytes[i]] | g565[src_bytes[i + 1]] | b565[src_bytes[i + 2]]
+            out_buf[j] = rgb565 & 0xFF
+            out_buf[j + 1] = (rgb565 >> 8) & 0xFF
+            j += 2
+        return j
+
+    def _write_center_band(self, band_data, copy_w, copy_h, dst_x, dst_y):
+        bpp = self.bytes_per_pixel
+        row_bytes = copy_w * bpp
+        write_len = copy_h * row_bytes
+
+        # Fast contiguous write when the active region spans full framebuffer width.
+        if dst_x == 0 and row_bytes == self.line_length:
+            off = dst_y * self.line_length
+            self.mm.seek(off)
+            self.mm.write(band_data[:write_len])
+            return
+
+        # Generic row-by-row write for side padding/stride mismatches.
+        src_off = 0
+        dst_off = (dst_y * self.line_length) + (dst_x * bpp)
+        for _ in range(copy_h):
+            self.mm.seek(dst_off)
+            self.mm.write(band_data[src_off:src_off + row_bytes])
+            src_off += row_bytes
+            dst_off += self.line_length
 
     def update(self, pil_image):
-        stride_pixels = self.line_length // (self.bpp // 8)
-        native_img = Image.new("RGB", (stride_pixels, self.yres), "black")
-
-        src = pil_image.convert("RGB")
+        # Avoid needless conversion copies if input is already RGB.
+        src = pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
         copy_w = min(src.width, self.xres)
         copy_h = min(src.height, self.yres)
 
         src_x = max(0, (src.width - copy_w) // 2)
         src_y = max(0, (src.height - copy_h) // 2)
-        cropped = src.crop((src_x, src_y, src_x + copy_w, src_y + copy_h))
+        # Only crop when needed to avoid extra allocations.
+        if src_x == 0 and src_y == 0 and copy_w == src.width and copy_h == src.height:
+            cropped = src
+        else:
+            cropped = src.crop((src_x, src_y, src_x + copy_w, src_y + copy_h))
 
         dst_x = max(0, (self.xres - copy_w) // 2)
         dst_y = max(0, (self.yres - copy_h) // 2)
-        native_img.paste(cropped, (dst_x, dst_y))
+
+        # Fast path: source already aligned to full framebuffer width.
+        # Common NeoDCT case on 240x240 fb with 240x175 UI band.
+        if src_x == 0 and src_y == 0 and copy_w == src.width and copy_h == src.height:
+            if self.bpp == 16:
+                try:
+                    band = src.tobytes("raw", "BGR;16")
+                except ValueError:
+                    src_bytes = src.tobytes()
+                    used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
+                    band = self._rgb565_band_out[:used]
+                self._write_center_band(band, copy_w, copy_h, dst_x, dst_y)
+                return
+            if self.bpp == 32:
+                band = src.convert("RGBA").tobytes("raw", "BGRA")
+                self._write_center_band(band, copy_w, copy_h, dst_x, dst_y)
+                return
+
+        # Clear reusable target, then paste current frame.
+        self.native_img.paste(self._black, (0, 0, self.stride_pixels, self.yres))
+        self.native_img.paste(cropped, (dst_x, dst_y))
 
         if self.bpp == 32:
-            data = native_img.convert("RGBA").tobytes("raw", "BGRA")
+            data = self.native_img.convert("RGBA").tobytes("raw", "BGRA")
         elif self.bpp == 16:
-            rgb_img = native_img.convert("RGB")
+            rgb_img = self.native_img
             try:
                 # Fast path when Pillow build supports this packer.
                 data = rgb_img.tobytes("raw", "BGR;16")
             except ValueError:
                 # Fallback for minimal Pillow builds: software-pack RGB565.
-                src = rgb_img.tobytes()
-                out = bytearray((len(src) // 3) * 2)
-                j = 0
-                for i in range(0, len(src), 3):
-                    r = src[i]
-                    g = src[i + 1]
-                    b = src[i + 2]
-                    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                    out[j] = rgb565 & 0xFF
-                    out[j + 1] = (rgb565 >> 8) & 0xFF
-                    j += 2
-                data = bytes(out)
+                out = self._rgb565_out
+                self._pack_rgb565(rgb_img.tobytes(), out)
+                data = out
         else:
-            data = native_img.convert("RGB").tobytes()
+            data = self.native_img.tobytes()
             
         self.mm.seek(0)
-        self.mm.write(data[:self.size])
+        self.mm.write(data if len(data) == self.size else data[:self.size])
 
 def init_databases():
         """ Checks for User DBs and creates them if missing. """
@@ -207,9 +282,14 @@ class NeoDCT_UI:
 
         self.wallpaper = self.load_wallpaper(wallpaper_path) if wallpaper_path else None
         
+        engineering_mode = _setting_is_enabled(
+            get_setting("system.ui.engineering_mode", "ON"),
+            default=True,
+        )
+
         self.apps = []
         app_dirs = ["/NeoDCT/System/apps"]
-        if ENGINEERING_MODE:
+        if engineering_mode:
             app_dirs.append("/NeoDCT/System/engineering/apps")
 
         try:
