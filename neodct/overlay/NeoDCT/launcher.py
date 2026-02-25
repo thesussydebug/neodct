@@ -1,14 +1,22 @@
 import sys
 import os
 import time
-# Redirect all print() output to Serial
-sys.stdout = open('/dev/ttyAMA0', 'w')
-sys.stderr = sys.stdout
 # Add current directory to path so we can import 'System' modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import the Hardware Driver and UI
 from System.core import main as ui_engine
+
+
+def _redirect_stdio_to_serial():
+    serial_dev = getattr(ui_engine, "SERIAL_CONSOLE_DEVICE", "/dev/ttyAMA0")
+    try:
+        serial_out = open(serial_dev, "w")
+        sys.stdout = serial_out
+        sys.stderr = serial_out
+        print(f"[Launcher] Serial console active: {serial_dev}")
+    except Exception as exc:
+        print(f"[Launcher] Serial redirect failed for {serial_dev}: {exc}")
 
 def show_boot_logo(fb):
     from PIL import Image, ImageDraw, ImageFont
@@ -44,6 +52,8 @@ def show_boot_logo(fb):
     fb.update(canvas)
 
 def main():
+    _redirect_stdio_to_serial()
+
     # 1. Init Hardware
     print("[Launcher] Initializing Hardware...")
     fb = ui_engine.Framebuffer() # We reuse the driver from main.py

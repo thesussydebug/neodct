@@ -90,6 +90,12 @@ def _refresh_engineering_apps(ui, enabled):
     if not hasattr(ui, "apps"):
         return
 
+    # Keep runtime flag in sync for services that branch on engineering mode.
+    try:
+        ui.engineering_mode = bool(enabled)
+    except Exception:
+        pass
+
     filtered = [
         app
         for app in ui.apps

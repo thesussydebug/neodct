@@ -10,6 +10,7 @@ import time
 import select
 import json
 import fcntl
+import traceback
 # --- THE FIX: Import ImageFile to handle "broken" JPEGs ---
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFile 
 from System.ui.framework import AppSelector, SoftKeyBar
@@ -17,6 +18,7 @@ from System.core.SettingsStorage import get_setting
 import importlib.util
 import sqlite3
 from System.core.ModemService import ModemService
+from System.core.CrashHandler import show_app_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
 from System.core.ErrorScreen import show_alpha_security_notice_once
@@ -33,6 +35,7 @@ SOFTKEY_HEIGHT = 30
 WIDTH = UI_WIDTH
 HEIGHT = UI_HEIGHT
 WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
+SERIAL_CONSOLE_DEVICE = os.environ.get("NEODCT_SERIAL_DEVICE", "/dev/ttyAMA0")
 
 
 def _setting_is_enabled(value, default=True):
@@ -286,6 +289,7 @@ class NeoDCT_UI:
             get_setting("system.ui.engineering_mode", "ON"),
             default=True,
         )
+        self.engineering_mode = engineering_mode
 
         self.apps = []
         app_dirs = ["/NeoDCT/System/apps"]
@@ -460,21 +464,42 @@ class NeoDCT_UI:
 
     def launch_app(self, app):
         path = os.path.join(app["path"], app["exec"])
+        try:
+            spec = importlib.util.spec_from_file_location("neodct_app", path)
+            if spec is None or spec.loader is None:
+                print(f"[OS] App load failed: {path}")
+                return
 
-        spec = importlib.util.spec_from_file_location("neodct_app", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
 
-        if hasattr(module, "run"):
-            module.run(self)
+            if hasattr(module, "run"):
+                module.run(self)
+            else:
+                print(f"[OS] App has no run(ui): {path}")
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            app_name = app.get("name", "(unknown)")
+            print(f"[OS] App crashed: {app_name} ({path})")
+            traceback.print_exc()
+            show_app_crash(self)
 
     def render_menu(self):
-        menu = AppSelector("Main Menu", self.apps, self, background=self.wallpaper)
-        choice = menu.show()
-        if choice != -1:
-            print(f"[OS] Launching App ID: {choice}")
-            self.launch_app(self.apps[choice])
-        self.state = "HOME"
+        try:
+            menu = AppSelector("Main Menu", self.apps, self, background=self.wallpaper)
+            choice = menu.show()
+            if choice != -1:
+                print(f"[OS] Launching App ID: {choice}")
+                self.launch_app(self.apps[choice])
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            print("[OS] Menu crashed")
+            traceback.print_exc()
+        finally:
+            # Always unwind menu state so one bad app/menu event cannot trap the core loop.
+            self.state = "HOME"
 
     def update(self):
         if self.state == "HOME":
@@ -547,11 +572,18 @@ def run(fb):
     print("[CORE] Entering Main Loop...")
 
     while True:
-        ui.update()
-        key = ui.read_keypress(0.1)
-        if key is not None:
-            print(f"[INPUT] Code: {key}")
-            ui.handle_input(key)
+        try:
+            ui.update()
+            key = ui.read_keypress(0.1)
+            if key is not None:
+                print(f"[INPUT] Code: {key}")
+                ui.handle_input(key)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            print("[CORE] Unhandled exception in main loop")
+            traceback.print_exc()
+            time.sleep(0.1)
 
 if __name__ == "__main__":
     fb = Framebuffer()

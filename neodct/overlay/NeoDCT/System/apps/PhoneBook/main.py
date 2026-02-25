@@ -4,9 +4,22 @@ import time
 from System.ui.framework import VerticalList, SoftKeyBar, TextInput
 import System.apps.PhoneBook.shared.list_ui as contact_manager
 
-# Redirect all print() output to Serial
-sys.stdout = open('/dev/ttyAMA0', 'w')
-sys.stderr = sys.stdout
+
+def _ensure_serial_redirect():
+    try:
+        from System.core import main as core_main
+        serial_dev = getattr(core_main, "SERIAL_CONSOLE_DEVICE", None)
+        if not serial_dev:
+            return
+        if getattr(sys.stdout, "name", None) != serial_dev:
+            serial_out = open(serial_dev, "w")
+            sys.stdout = serial_out
+            sys.stderr = serial_out
+    except Exception:
+        pass
+
+
+_ensure_serial_redirect()
 
 
 def _screen_metrics(ui):
