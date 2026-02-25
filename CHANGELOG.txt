@@ -4,7 +4,7 @@ Version 0.2.0a - 2026-02-25
 
 Summary
 - Major milestone release focused on real hardware constraints and performance.
-- Skipped 0.1.9a and moved directly to 0.2.0a due to scope and platform changes.
+- Moved directly to 0.2.0a due to scope and platform changes.
 
 Build Organization and Milestones
 - 0.2 introduces a cleaner split between software versioning and hardware progress tracking.
