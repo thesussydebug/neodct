@@ -31,6 +31,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 FB_PATH = "/dev/fb0"
 KEYPAD_PATH = "/dev/input/event0"
 KEYPAD_DEVICE_ENV = "NEODCT_KEYPAD_DEVICE"
+KEYMAP_PATH = "/NeoDCT/User/keymap.json"
 UI_WIDTH = 240
 UI_HEIGHT = 175
 SOFTKEY_HEIGHT = 30
@@ -38,6 +39,38 @@ WIDTH = UI_WIDTH
 HEIGHT = UI_HEIGHT
 WALLPAPER_PATH = "/NeoDCT/User/wallpaper.jpg"
 SERIAL_CONSOLE_DEVICE = os.environ.get("NEODCT_SERIAL_DEVICE", "/dev/ttyAMA0")
+
+MATRIX_NAME_TO_CODE = {
+    "navikey": 28,
+    "clear": 14,
+    "up": 103,
+    "down": 108,
+    "left": 105,
+    "right": 106,
+    "menu": 50,
+    "enter": 28,
+    "back": 14,
+    "num_1": 2,
+    "num_2": 3,
+    "num_3": 4,
+    "num_4": 5,
+    "num_5": 6,
+    "num_6": 7,
+    "num_7": 8,
+    "num_8": 9,
+    "num_9": 10,
+    "num_0": 11,
+    "star": 42,
+    "hash": 43,
+}
+
+try:
+    from gpiozero import Button, OutputDevice
+    GPIOZERO_IMPORT_ERROR = None
+except Exception as exc:
+    Button = None
+    OutputDevice = None
+    GPIOZERO_IMPORT_ERROR = str(exc)
 
 
 def _setting_is_enabled(value, default=True):
@@ -104,6 +137,135 @@ def _discover_keypad_path():
 
     print(f"[INPUT] No input event device found; defaulting to {KEYPAD_PATH}")
     return KEYPAD_PATH
+
+
+def _gpio_available():
+    return len(glob.glob("/dev/gpiochip*")) > 0
+
+
+def _load_matrix_keymap(path=KEYMAP_PATH):
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print(f"[INPUT] Keymap read failed ({path}): {exc}")
+        return None
+
+    row_pins = payload.get("row_pins")
+    col_pins = payload.get("col_pins")
+    keys = payload.get("keys")
+
+    if not isinstance(row_pins, list) or not isinstance(col_pins, list) or not isinstance(keys, dict):
+        print(f"[INPUT] Keymap ignored (missing matrix fields): {path}")
+        return None
+
+    try:
+        row_pins = [int(pin) for pin in row_pins]
+        col_pins = [int(pin) for pin in col_pins]
+    except Exception as exc:
+        print(f"[INPUT] Keymap ignored (invalid pin list): {exc}")
+        return None
+
+    matrix_to_code = {}
+    for name, entry in keys.items():
+        if not isinstance(entry, dict):
+            continue
+        code = MATRIX_NAME_TO_CODE.get(name)
+        if code is None:
+            continue
+        try:
+            row = int(entry["row"])
+            col = int(entry["col"])
+        except Exception:
+            continue
+        matrix_to_code[(row, col)] = int(code)
+
+    if not matrix_to_code:
+        print(f"[INPUT] Keymap ignored (no recognized keys): {path}")
+        return None
+
+    return {
+        "path": path,
+        "format": payload.get("format", "unknown"),
+        "row_pins": row_pins,
+        "col_pins": col_pins,
+        "matrix_to_code": matrix_to_code,
+    }
+
+
+class MatrixKeypadInput:
+    def __init__(self, cfg):
+        self.path = cfg["path"]
+        self.row_pins = list(cfg["row_pins"])
+        self.col_pins = list(cfg["col_pins"])
+        self.matrix_to_code = dict(cfg["matrix_to_code"])
+        self.rows = [OutputDevice(pin, initial_value=True) for pin in self.row_pins]
+        self.cols = [Button(pin, pull_up=True) for pin in self.col_pins]
+        self._held = None
+        self._last_unmapped = None
+
+    def close(self):
+        for row in self.rows:
+            try:
+                row.on()
+            except Exception:
+                pass
+            try:
+                row.close()
+            except Exception:
+                pass
+        for col in self.cols:
+            try:
+                col.close()
+            except Exception:
+                pass
+
+    def _scan_once(self):
+        pressed = None
+        for row_idx, row in enumerate(self.rows):
+            row.off()
+            time.sleep(0.001)
+            for col_idx, col in enumerate(self.cols):
+                if col.is_pressed:
+                    pressed = (row_idx, col_idx)
+                    break
+            row.on()
+            if pressed is not None:
+                break
+
+        if pressed is None:
+            self._held = None
+            self._last_unmapped = None
+            return None
+
+        if pressed == self._held:
+            return None
+        self._held = pressed
+
+        code = self.matrix_to_code.get(pressed)
+        if code is None:
+            if pressed != self._last_unmapped:
+                self._last_unmapped = pressed
+                print(f"[INPUT] Matrix key {pressed} has no mapping in {self.path}")
+            return None
+
+        self._last_unmapped = None
+        return code
+
+    def read_key(self, timeout):
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+
+        while True:
+            code = self._scan_once()
+            if code is not None:
+                return code
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.005)
 
 # --- HARDWARE DRIVER ---
 class Framebuffer:
@@ -296,21 +458,53 @@ class NeoDCT_UI:
         self.DEV_KEYMAP = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 
             7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
-            12: "-", 52: ".", 51: ",", 42: "*", 28: "#"
+            12: "-", 52: ".", 51: ",", 42: "*", 43: "#", 28: "#"
         }
         self.W = UI_WIDTH
         self.H = UI_HEIGHT
         self.SOFTKEY_H = SOFTKEY_HEIGHT
         self.content_bottom = self.H - self.SOFTKEY_H
+        self.keypad_fd = None
+        self.keypad_path = None
+        self.matrix_input = None
+
+        matrix_cfg = _load_matrix_keymap(KEYMAP_PATH)
+        if matrix_cfg:
+            if GPIOZERO_IMPORT_ERROR is not None:
+                print(f"[INPUT] Keymap present, but gpiozero is unavailable: {GPIOZERO_IMPORT_ERROR}")
+            elif not _gpio_available():
+                print("[INPUT] Keymap present, but no /dev/gpiochip* devices were found.")
+            else:
+                try:
+                    self.matrix_input = MatrixKeypadInput(matrix_cfg)
+                    print(
+                        f"[INPUT] Matrix input active from {matrix_cfg['path']} "
+                        f"(rows={matrix_cfg['row_pins']} cols={matrix_cfg['col_pins']})."
+                    )
+                except Exception as exc:
+                    self.matrix_input = None
+                    print(f"[INPUT] Matrix init failed; falling back to evdev: {exc}")
+
         self.keypad_path = _discover_keypad_path()
         try:
             self.keypad_fd = os.open(self.keypad_path, os.O_RDONLY | os.O_NONBLOCK)
         except Exception as e:
             print(f"[INPUT] Failed opening {self.keypad_path}: {e}")
-            print(f"[INPUT] Falling back to {KEYPAD_PATH}")
-            self.keypad_path = KEYPAD_PATH
-            self.keypad_fd = os.open(self.keypad_path, os.O_RDONLY | os.O_NONBLOCK)
-        print(f"[INPUT] Listening on {self.keypad_path}")
+            if self.keypad_path != KEYPAD_PATH:
+                try:
+                    print(f"[INPUT] Falling back to {KEYPAD_PATH}")
+                    self.keypad_path = KEYPAD_PATH
+                    self.keypad_fd = os.open(self.keypad_path, os.O_RDONLY | os.O_NONBLOCK)
+                except Exception as e2:
+                    print(f"[INPUT] Evdev fallback failed: {e2}")
+                    self.keypad_fd = None
+            else:
+                self.keypad_fd = None
+
+        if self.keypad_fd is not None:
+            print(f"[INPUT] Listening on {self.keypad_path}")
+        elif self.matrix_input is None:
+            print("[INPUT] WARNING: no active input backend.")
         self.softkey = SoftKeyBar(self)
 
         self.fb = fb_driver
@@ -581,19 +775,37 @@ class NeoDCT_UI:
             self.render_menu()
 
     def read_keypress(self, timeout=0.1):
-        r, _, _ = select.select([self.keypad_fd], [], [], timeout)
+        # Primary path: GPIO matrix keymap (if present and initialized).
+        # Backward-compatible fallback: still read evdev keyboard events.
+        if self.matrix_input is not None:
+            key = self.matrix_input.read_key(timeout)
+            if key is not None:
+                return key
+            # No matrix key this cycle; continue to evdev fallback if available.
+
+        if self.keypad_fd is None:
+            return None
+
+        try:
+            r, _, _ = select.select([self.keypad_fd], [], [], timeout)
+        except Exception:
+            return None
         if not r:
             return None
 
-        data = os.read(self.keypad_fd, 24)
+        try:
+            data = os.read(self.keypad_fd, 24)
+        except Exception:
+            return None
+
         if len(data) == 24:
-            sec, usec, type, code, val = struct.unpack('llHHI', data)
+            sec, usec, etype, code, val = struct.unpack('llHHI', data)
         elif len(data) == 16:
-            sec, usec, type, code, val = struct.unpack('IIHHI', data)
+            sec, usec, etype, code, val = struct.unpack('IIHHI', data)
         else:
              return None
 
-        if type == 1 and val == 1:
+        if etype == 1 and val == 1:
             return code
         return None
 

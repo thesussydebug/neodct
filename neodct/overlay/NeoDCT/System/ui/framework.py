@@ -132,11 +132,12 @@ class AppSelector:
         """ Blocking loop """
         
         # --- INPUT FLUSH ---
-        if hasattr(self.ui, 'keypad_fd'):
+        fd = getattr(self.ui, "keypad_fd", None)
+        if fd is not None:
             while True:
-                r, w, x = select.select([self.ui.keypad_fd], [], [], 0.01)
+                r, w, x = select.select([fd], [], [], 0.01)
                 if r:
-                    try: os.read(self.ui.keypad_fd, 24)
+                    try: os.read(fd, 24)
                     except: pass
                 else: break 
 
@@ -909,12 +910,13 @@ class PagedList:
     def show(self):
         """Blocking loop. Returns selected index or -1 for back."""
         # Input flush (mirrors AppSelector behavior)
-        if hasattr(self.ui, "keypad_fd"):
+        fd = getattr(self.ui, "keypad_fd", None)
+        if fd is not None:
             while True:
-                r, _, _ = select.select([self.ui.keypad_fd], [], [], 0.01)
+                r, _, _ = select.select([fd], [], [], 0.01)
                 if r:
                     try:
-                        os.read(self.ui.keypad_fd, 24)
+                        os.read(fd, 24)
                     except:
                         pass
                 else:

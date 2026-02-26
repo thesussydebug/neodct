@@ -165,15 +165,17 @@ def show_calling(ui, number, name=None):
     Uses key 14 (Backspace/C) and also allows 28 (center) as End.
     """
     softkey = SoftKeyBar(ui)
-    # Open keypad if not already open on ui
+    use_ui_reader = hasattr(ui, "read_keypress")
     fd = None
-    if hasattr(ui, "keypad_fd"):
-        fd = ui.keypad_fd
-    else:
-        fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
-        ui.keypad_fd = fd
 
-    _flush_input(fd)
+    # Legacy fallback path for standalone execution.
+    if not use_ui_reader:
+        if hasattr(ui, "keypad_fd"):
+            fd = ui.keypad_fd
+        else:
+            fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
+            ui.keypad_fd = fd
+        _flush_input(fd)
 
     # Main loop: update screen periodically so clock updates
     last_draw = 0.0
@@ -185,7 +187,10 @@ def show_calling(ui, number, name=None):
             last_draw = now
             softkey.update("End")
 
-        key = _read_keypress(fd, timeout=0.10)
+        if use_ui_reader:
+            key = ui.read_keypress(0.10)
+        else:
+            key = _read_keypress(fd, timeout=0.10)
         if key is None:
             continue
 

@@ -75,6 +75,12 @@ class SnakeGame:
         return self.keypad_fd
 
     def poll_key(self, timeout):
+        if hasattr(self.ui, "read_keypress"):
+            try:
+                return self.ui.read_keypress(timeout)
+            except Exception:
+                pass
+
         fd = self.ensure_keypad()
         if fd is None:
             time.sleep(timeout)
