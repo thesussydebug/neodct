@@ -1,0 +1,57 @@
+NeoDCT Session Change Summary
+Date: 2026-02-25
+
+1) Buildroot package/config slimming (QEMU)
+- Removed heavyweight browser/graphics stack from QEMU defconfig path:
+  - cage, netsurf, mesa3d, webkitgtk, libgtk3, libwpe, wayland/wlroots/wlr-randr, xorg stack, mpv, gstreamer, ffmpeg (where applicable in buildroot-side config).
+- Kept minimal UI/browser base:
+  - python3 (+ssl/sqlite/xz), python-pillow, freetype, dejavu, ca-certificates, links, links graphics, gpm.
+- Added python-mutagen back for MusicPlayer metadata/art parsing.
+
+2) Browser app behavior change
+- Updated WebBrowser launcher to run links directly instead of old test/cage launch scripts.
+  - File: neodct/overlay/NeoDCT/System/apps/WebBrowser/launch.sh
+
+3) Overlay path fix
+- Fixed overlay path in active defconfigs to use the project overlay location:
+  - BR2_ROOTFS_OVERLAY="../neodct/overlay"
+
+4) Version updates (QEMU + OS settings)
+- Updated QEMU banner string to:
+  - NeoDCT System v0.2.0a
+- Updated NeoDCT settings defaults/runtime version fields to:
+  - system.os.versionnumber=0.2.0a
+  - system.os.versionname=NeoDCT System v0.2.0a
+
+5) Luckfox-specific defconfig creation and sync
+- Created/maintained luckfox_pico_mini_defconfig in both locations:
+  - neodct/configs/luckfox_pico_mini_defconfig
+  - buildroot/configs/luckfox_pico_mini_defconfig
+- Synced luckfox defconfig from active build-luckfox .config state (so settings are preserved).
+
+6) Luckfox rootfs test-prune + serial console inittab patching
+- Added Luckfox post-build script usage in luckfox defconfig to remove /tests from target.
+- Added new file:
+  - neodct/overlay/etc/inittab.luckfox
+- Updated post-build script to replace target /etc/inittab with /etc/inittab.luckfox when present.
+- Luckfox inittab now includes serial getty redundancy on both:
+  - ttyFIQ0 (1500000)
+  - ttyAMA0 (1500000)
+
+7) Font loading reliability
+- Enabled freetype package in active defconfigs so Pillow truetype font loading works for Nokia FC font path.
+
+Files touched (high-level)
+- neodct/configs/neodct_qemu_defconfig
+- buildroot/configs/neodct_qemu_defconfig
+- neodct/configs/luckfox_pico_mini_defconfig
+- buildroot/configs/luckfox_pico_mini_defconfig
+- neodct/overlay/NeoDCT/System/apps/WebBrowser/launch.sh
+- neodct/overlay/NeoDCT/System/core/SettingsStorage/__init__.py
+- neodct/overlay/NeoDCT/User/settings.prop
+- neodct/scripts/post-build-prune-tests.sh
+- neodct/overlay/etc/inittab.luckfox
+
+Notes
+- Luckfox defconfig was intentionally kept editable and then synced to preserve your active .config.
+- QEMU and Luckfox support separate output directories via O=... workflows.

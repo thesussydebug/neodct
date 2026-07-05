@@ -1,0 +1,61 @@
+NeoDCT Changelog
+
+Version 0.2.0a - 2026-02-25
+
+Summary
+- Major milestone release focused on real hardware constraints and performance.
+- Moved directly to 0.2.0a due to scope and platform changes.
+
+Build Organization and Milestones
+- 0.2 introduces a cleaner split between software versioning and hardware progress tracking.
+- Build identifiers now stay software-only (for example: `v0.2.0a`), without milestone tags in the build name.
+- Hardware stages (PROTO/EVT/DVT/PVT) are now treated as parallel project-tracking states, not version suffixes.
+- This allows simultaneous work across tracks (for example, PROTO0 experiments and EVT0 target bring-up in the same timeframe) without version-label confusion.
+- Legacy milestone-style build labels were dropped as part of this refactor.
+
+Platform
+- Primary SBC target changed from Radxa Zero 3W to Luckfox Pico Mini B.
+- Luckfox profile now reflects practical embedded constraints for NeoDCT engineering:
+  - CPU: single Cortex-A7 @ 1.2 GHz
+  - RAM: 64 MB
+  - Storage: built-in 128 MB SPI flash + SD expansion
+- Buildroot is now running on real hardware for this track.
+
+System/Buildroot
+- Slimmed package set for core UI path and removed heavyweight desktop/browser stack from the lean configs:
+  - removed/disabled: Cage, Wayland/Wlroots/Wlr-randr, X.org stack, WebKitGTK, NetSurf, Mesa stack, and related extras in lean profiles.
+- Kept minimum runtime set for NeoDCT UI and lightweight browsing workflow:
+  - Python3 (+ssl/sqlite/xz), Pillow, FreeType, DejaVu, CA certs, Links (+graphics), GPM.
+- Re-added python-mutagen for Music Player metadata/art handling.
+- Fixed overlay pathing in active configs to `../neodct/overlay`.
+- Added split-output workflow support (`O=...`) for separate QEMU and Luckfox build trees.
+
+Rendering/Performance
+- Core framebuffer pipeline in `System/core/main.py` was optimized (no external renderer split):
+  - reduced per-frame allocations by reusing buffers/images
+  - reduced unnecessary conversions/crops
+  - optimized RGB565 fallback path with lookup tables and reusable output buffers
+  - added partial center-band write path for common UI case to avoid unnecessary full-frame work
+- Result: noticeably smoother software rendering in QEMU bottleneck testing and improved perceived UI smoothness.
+
+Engineering/Apps
+- Engineering app layout standardized under `/NeoDCT/System/engineering`.
+- Added CubeBench engineering app (pure software PIL 3D spinning cube) as a baseline rendering benchmark.
+- Added Luckfox-specific init behavior:
+  - `inittab.luckfox` with serial console handling for hardware bring-up
+  - guarded post-build application so Luckfox-specific inittab does not leak into QEMU builds
+  - serial redundancy configured for `ttyFIQ0` and `ttyAMA0` in Luckfox profile
+- Luckfox post-build currently prunes `/tests` for smaller rootfs in that profile.
+
+Versioning/UI
+- Updated version strings/banners to 0.2.0a context.
+- QEMU banner and settings fields were aligned during transition work.
+
+Browser Direction
+- WebKitGTK is no longer viable for the 64 MB RAM target.
+- Browser app path has shifted to lightweight Links for now.
+- Full web experience will require a reworked approach suitable for ultra-constrained memory.
+
+Notes
+- This release is primarily an under-the-hood engineering leap toward true device-level constraints, not just emulator convenience.
+- The new constraints are intentionally closer to classic feature-phone-era engineering tradeoffs.
