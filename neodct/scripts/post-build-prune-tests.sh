@@ -12,9 +12,11 @@ rm -rf "$TARGET_DIR/tests"
 
 # Luckfox-specific console config: replace generic inittab
 # only when called with the explicit luckfox flavor argument.
+LUCKFOX_INITTAB="$TARGET_DIR/etc/inittab.luckfox"
 if [ "$FLAVOR" = "luckfox" ]; then
-    LUCKFOX_INITTAB="$TARGET_DIR/etc/inittab.luckfox"
     if [ -f "$LUCKFOX_INITTAB" ]; then
         cp "$LUCKFOX_INITTAB" "$TARGET_DIR/etc/inittab"
     fi
 fi
+# Either way, don't ship the flavor-specific file itself
+rm -f "$LUCKFOX_INITTAB"
