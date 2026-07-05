@@ -4,7 +4,7 @@ NeoDCT is a custom embedded Linux device designed to fit inside a Nokia 5110 / 5
 
 ## Planned Hardware
 
-- **Compute**: Radxa Zero 3W (RK3566, 1 GB RAM)
+- **Compute**: Luckfox Pico Mini B (RV1103, Cortex-A7 w/ NEON, 64 MB RAM)
 - **Display**: 240 × 240 ST7789 IPS LCD
 - **Input**: Original Nokia keypad, wired directly to GPIO (using publicly available schematics)
 - **Connectivity**: Waveshare SIM7600G-H 4G LTE modem (with GPS)
@@ -13,6 +13,8 @@ NeoDCT is a custom embedded Linux device designed to fit inside a Nokia 5110 / 5
 
 > **Note:** Minor faceplate modifications will be required to accommodate the taller display.  
 > Finding an ST7789 panel that matches the original Nokia aspect ratio is unfortunately difficult.
+>
+> I've decided recently to switch the hardware target from a Radxa Zero 3W to a Luckfox Pico Mini B. The Luckfox is a MUCH smaller and more limited. In my opinion, this better fits the vibe of a dumb phone.
 
 # NeoDCT OS
 
@@ -39,7 +41,6 @@ Because NeoDCT OS is built on top of Linux, it can run more than just classic fe
 
 <p float="left">
   <img src="docs/img/qemu-mp3player.png" width="240">
-  <img src="docs/img/qemu-webbrowser.png" width="240">
 </p>
 
 ---
