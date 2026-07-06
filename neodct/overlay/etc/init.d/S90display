@@ -1,0 +1,12 @@
+#!/bin/sh
+# NeoDCT display shim - only runs on hardware with the SPI panel
+[ -e /dev/spidev0.0 ] || exit 0
+case "$1" in
+  start)
+    /NeoDCT/System/hw/neodct_displayd > /dev/null 2>&1 &
+    ;;
+  stop)
+    killall neodct_displayd 2>/dev/null
+    ;;
+esac
+exit 0
