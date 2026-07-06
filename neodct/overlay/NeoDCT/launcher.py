@@ -9,7 +9,17 @@ from System.core import main as ui_engine
 
 
 def _redirect_stdio_to_serial():
-    serial_dev = getattr(ui_engine, "SERIAL_CONSOLE_DEVICE", "/dev/ttyAMA0")
+    # Detect environment to route standard output correctly:
+    # /dev/ttyFIQ0 is the hardware fast interrupt console (Real Rockchip/Luckfox hardware)
+    # /dev/ttyAMA0 is the emulated PL011 UART (QEMU environment)
+    if os.path.exists("/dev/ttyFIQ0"):
+        serial_dev = "/dev/ttyFIQ0"
+    elif os.path.exists("/dev/ttyAMA0"):
+        serial_dev = "/dev/ttyAMA0"
+    else:
+        # Fallback just in case neither exists
+        serial_dev = getattr(ui_engine, "SERIAL_CONSOLE_DEVICE", "/dev/ttyAMA0")
+        
     try:
         serial_out = open(serial_dev, "w")
         sys.stdout = serial_out
@@ -22,17 +32,17 @@ def show_boot_logo(fb):
     from PIL import Image, ImageDraw, ImageFont
     screen_w = getattr(ui_engine, "UI_WIDTH", 240)
     screen_h = getattr(ui_engine, "UI_HEIGHT", 175)
-    
+
     canvas = Image.new("RGB", (screen_w, screen_h), "black")
     draw = ImageDraw.Draw(canvas)
-    
+
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
     except:
         font = ImageFont.load_default()
         font_small = ImageFont.load_default()
-        
+
     # --- FIX START ---
     # Draw "NeoDCT System"
     text = "Starting NeoDCT..."
@@ -41,14 +51,14 @@ def show_boot_logo(fb):
     w = bbox[2] - bbox[0] # Calculate width
     title_y = max(20, int(screen_h * 0.35))
     draw.text(((screen_w - w) // 2, title_y), text, font=font, fill="white")
-    
+
     # Draw Version
     ver = "System v0.2.1a"
     bbox = draw.textbbox((0, 0), ver, font=font_small)
     w = bbox[2] - bbox[0]
     draw.text(((screen_w - w) // 2, title_y + 30), ver, font=font_small, fill="gray")
     # --- FIX END ---
-    
+
     fb.update(canvas)
 
 def main():
@@ -57,11 +67,11 @@ def main():
     # 1. Init Hardware
     print("[Launcher] Initializing Hardware...")
     fb = ui_engine.Framebuffer() # We reuse the driver from main.py
-    
+
     # 2. Show Boot Splash
     show_boot_logo(fb)
     time.sleep(1) # Let it shine for 1 second
-    
+
     # 3. Launch Main UI
     print("[Launcher] Starting UI...")
     ui_engine.run(fb)
