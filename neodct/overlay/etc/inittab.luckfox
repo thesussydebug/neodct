@@ -13,7 +13,6 @@
 # Serial login prompt redundancy:
 # If one device does not exist, init will fail that line and keep running.
 ttyFIQ0::respawn:/sbin/getty -L ttyFIQ0 1500000 vt100
-ttyAMA0::respawn:/sbin/getty -L ttyAMA0 1500000 vt100
 
 ::restart:/sbin/init
 ::ctrlaltdel:/sbin/reboot

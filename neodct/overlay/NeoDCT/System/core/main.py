@@ -187,12 +187,26 @@ def _load_matrix_keymap(path=KEYMAP_PATH):
         print(f"[INPUT] Keymap ignored (no recognized keys): {path}")
         return None
 
+    try:
+        i2c_addr_raw = payload.get("i2c_addr", 0x20)
+        if isinstance(i2c_addr_raw, str):
+            i2c_addr = int(i2c_addr_raw, 16) if i2c_addr_raw.lower().startswith("0x") else int(i2c_addr_raw)
+        else:
+            i2c_addr = int(i2c_addr_raw)
+        i2c_bus = int(payload.get("i2c_bus", 1))
+    except Exception as exc:
+        print(f"[INPUT] Keymap ignored (invalid i2c fields): {exc}")
+        return None
+
     return {
         "path": path,
         "format": payload.get("format", "unknown"),
+        "driver": payload.get("driver", "gpiozero-matrix"),
         "row_pins": row_pins,
         "col_pins": col_pins,
         "matrix_to_code": matrix_to_code,
+        "i2c_bus": i2c_bus,
+        "i2c_addr": i2c_addr,
     }
 
 
@@ -470,7 +484,24 @@ class NeoDCT_UI:
 
         matrix_cfg = _load_matrix_keymap(KEYMAP_PATH)
         if matrix_cfg:
-            if GPIOZERO_IMPORT_ERROR is not None:
+            driver = matrix_cfg.get("driver", "gpiozero-matrix")
+            if driver == "pcf8575-i2c":
+                i2c_dev = f"/dev/i2c-{matrix_cfg['i2c_bus']}"
+                if not os.path.exists(i2c_dev):
+                    print(f"[INPUT] Keymap wants {driver}, but {i2c_dev} does not exist.")
+                else:
+                    try:
+                        from System.hw.pcf8575_keypad import I2CMatrixKeypadInput
+                        self.matrix_input = I2CMatrixKeypadInput(matrix_cfg)
+                        print(
+                            f"[INPUT] I2C matrix input active from {matrix_cfg['path']} "
+                            f"(bus={matrix_cfg['i2c_bus']} addr=0x{matrix_cfg['i2c_addr']:02X} "
+                            f"rows={matrix_cfg['row_pins']} cols={matrix_cfg['col_pins']})."
+                        )
+                    except Exception as exc:
+                        self.matrix_input = None
+                        print(f"[INPUT] I2C matrix init failed; falling back to evdev: {exc}")
+            elif GPIOZERO_IMPORT_ERROR is not None:
                 print(f"[INPUT] Keymap present, but gpiozero is unavailable: {GPIOZERO_IMPORT_ERROR}")
             elif not _gpio_available():
                 print("[INPUT] Keymap present, but no /dev/gpiochip* devices were found.")
