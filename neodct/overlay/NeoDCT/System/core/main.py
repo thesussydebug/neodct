@@ -317,6 +317,27 @@ class Framebuffer:
         self._rgb565_out = bytearray(self.size)
         self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
 
+        # Detect the pixel conversion path ONCE (Pillow >= 11 removed the
+        # "BGR;16" packer, which silently forced the slow Python loop).
+        self._has_bgr16 = False
+        if self.bpp == 16:
+            try:
+                Image.new("RGB", (1, 1)).tobytes("raw", "BGR;16")
+                self._has_bgr16 = True
+            except Exception:
+                self._has_bgr16 = False
+
+        if self.bpp == 32:
+            path = "BGRA 32bpp (C, fast)"
+        elif self._has_bgr16:
+            path = "BGR;16 16bpp (C, fast)"
+        else:
+            path = "PYTHON RGB565 PACK 16bpp (SLOW -- ~350ms/frame on RV1103!)"
+        print(f"[FB] {self.xres}x{self.yres} @ {self.bpp}bpp, pixel path: {path}")
+        if self.bpp == 16 and not self._has_bgr16:
+            print("[FB] WARNING: on hardware, ensure neodct_displayd v2.1+ runs "
+                  "BEFORE the UI so the framebuffer is switched to 32bpp.")
+
     def _pack_rgb565(self, src_bytes, out_buf):
         r565 = self._r565
         g565 = self._g565
@@ -372,9 +393,9 @@ class Framebuffer:
         # Common NeoDCT case on 240x240 fb with 240x175 UI band.
         if src_x == 0 and src_y == 0 and copy_w == src.width and copy_h == src.height:
             if self.bpp == 16:
-                try:
+                if self._has_bgr16:
                     band = src.tobytes("raw", "BGR;16")
-                except ValueError:
+                else:
                     src_bytes = src.tobytes()
                     used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
                     band = self._rgb565_band_out[:used]
@@ -393,11 +414,11 @@ class Framebuffer:
             data = self.native_img.convert("RGBA").tobytes("raw", "BGRA")
         elif self.bpp == 16:
             rgb_img = self.native_img
-            try:
+            if self._has_bgr16:
                 # Fast path when Pillow build supports this packer.
                 data = rgb_img.tobytes("raw", "BGR;16")
-            except ValueError:
-                # Fallback for minimal Pillow builds: software-pack RGB565.
+            else:
+                # Fallback for Pillow >= 11 builds: software-pack RGB565.
                 out = self._rgb565_out
                 self._pack_rgb565(rgb_img.tobytes(), out)
                 data = out

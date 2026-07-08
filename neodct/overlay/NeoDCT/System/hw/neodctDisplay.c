@@ -1,5 +1,5 @@
 /*
- * neodctDisplay.c v2 — userspace ST7789 display daemon for NeoDCT
+ * neodctDisplay.c v2.1 — userspace ST7789 display daemon for NeoDCT
  * Luckfox Pico Mini B (RV1103), 240x240 Waveshare ST7789 over SPI0
  *
  * v2 changes (single-core RV1103 optimization):
@@ -83,6 +83,7 @@ static volatile int quit_flag = 0;
 
 static struct fb_var_screeninfo vinfo;
 static struct fb_fix_screeninfo finfo;
+static unsigned int fb_bytespp = 2;     /* granted fb bytes per pixel (2 or 4) */
 
 static unsigned char *out_buf  = NULL;  /* converted RGB565 big-endian rect */
 static size_t out_buf_size = 0;
@@ -311,12 +312,23 @@ static void fill_color(unsigned char r, unsigned char g, unsigned char b)
 
 static void force_mode(void)
 {
+    /* Prefer 32bpp: Python then packs via Pillow's C-speed "BGRA"
+     * rawmode (RGB565 "BGR;16" was removed in Pillow 11) and this
+     * daemon does the 565 packing during its existing copy loop.
+     * Fall back to 16bpp if the fb driver refuses 32. */
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) return;
     vinfo.xres = PANEL_W;  vinfo.yres = PANEL_H;
     vinfo.xres_virtual = PANEL_W;  vinfo.yres_virtual = PANEL_H;
-    vinfo.bits_per_pixel = 16;
-    if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0)
-        fprintf(stderr, "force_mode: FBIOPUT failed: %s\n", strerror(errno));
+    vinfo.bits_per_pixel = 32;
+    if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0 ||
+        (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0 &&
+         vinfo.bits_per_pixel != 32)) {
+        vinfo.xres = PANEL_W;  vinfo.yres = PANEL_H;
+        vinfo.xres_virtual = PANEL_W;  vinfo.yres_virtual = PANEL_H;
+        vinfo.bits_per_pixel = 16;
+        if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0)
+            fprintf(stderr, "force_mode: FBIOPUT failed: %s\n", strerror(errno));
+    }
 }
 
 static int init_framebuffer(void)
@@ -337,10 +349,15 @@ static int init_framebuffer(void)
     printf("fb0: %ux%u, %u bpp, line_length %u\n",
            vinfo.xres, vinfo.yres, vinfo.bits_per_pixel, finfo.line_length);
 
-    if (vinfo.bits_per_pixel != 16) {
-        fprintf(stderr, "expected 16 bpp framebuffer\n");
+    if (vinfo.bits_per_pixel != 16 && vinfo.bits_per_pixel != 32) {
+        fprintf(stderr, "expected 16 or 32 bpp framebuffer (got %u)\n",
+                vinfo.bits_per_pixel);
         return -1;
     }
+    fb_bytespp = vinfo.bits_per_pixel / 8;
+    printf("pixel path: %s\n", fb_bytespp == 4
+           ? "fb XRGB8888 -> daemon packs RGB565 (Python uses fast BGRA)"
+           : "fb RGB565 -> byte swap only (Python must pack 565 itself)");
 
     fb_size = (size_t)finfo.line_length * vinfo.yres;
     fb_data = mmap(NULL, fb_size, PROT_READ, MAP_SHARED, fb_fd, 0);
@@ -359,20 +376,35 @@ static int init_framebuffer(void)
     return 0;
 }
 
-/* Convert fb rect (fb-native little-endian RGB565) to panel big-endian
- * into out_buf. Returns byte count. */
+/* Convert fb rect to panel big-endian RGB565 into out_buf.
+ * 16bpp fb: byte-swap the native little-endian 565.
+ * 32bpp fb: pack XRGB8888 (bytes B,G,R,X) down to 565 -- this is the
+ * work Python used to do in a 346 ms/frame interpreter loop. */
 static size_t convert_rect(unsigned int x0, unsigned int y0,
                            unsigned int x1, unsigned int y1)
 {
     size_t n = 0;
     for (unsigned int y = y0; y <= y1; y++) {
         const unsigned char *src = fb_data + (size_t)y * finfo.line_length;
-        for (unsigned int x = x0; x <= x1; x++) {
-            unsigned short px = src[x * 2] | (src[x * 2 + 1] << 8);
-            if (opt_swap_rb)
-                px = (unsigned short)(((px & 0xF800) >> 11) | (px & 0x07E0) | ((px & 0x001F) << 11));
-            out_buf[n++] = px >> 8;         /* panel wants big-endian */
-            out_buf[n++] = px & 0xFF;
+        if (fb_bytespp == 4) {
+            for (unsigned int x = x0; x <= x1; x++) {
+                const unsigned char *p = src + (size_t)x * 4;
+                unsigned char b = p[0], g = p[1], r = p[2];
+                if (opt_swap_rb) { unsigned char t = r; r = b; b = t; }
+                unsigned short px = (unsigned short)(((r & 0xF8) << 8) |
+                                                     ((g & 0xFC) << 3) |
+                                                     (b >> 3));
+                out_buf[n++] = px >> 8;     /* panel wants big-endian */
+                out_buf[n++] = px & 0xFF;
+            }
+        } else {
+            for (unsigned int x = x0; x <= x1; x++) {
+                unsigned short px = src[x * 2] | (src[x * 2 + 1] << 8);
+                if (opt_swap_rb)
+                    px = (unsigned short)(((px & 0xF800) >> 11) | (px & 0x07E0) | ((px & 0x001F) << 11));
+                out_buf[n++] = px >> 8;
+                out_buf[n++] = px & 0xFF;
+            }
         }
     }
     return n;
@@ -384,7 +416,7 @@ static int render_dirty(void)
 {
     unsigned int copy_w = vinfo.xres < PANEL_W ? vinfo.xres : PANEL_W;
     unsigned int copy_h = vinfo.yres < PANEL_H ? vinfo.yres : PANEL_H;
-    size_t row_bytes = (size_t)copy_w * 2;
+    size_t row_bytes = (size_t)copy_w * fb_bytespp;
 
     /* pass 1: dirty row range */
     unsigned int ymin = copy_h, ymax = 0;
@@ -411,8 +443,8 @@ static int render_dirty(void)
         if (i < bmin) bmin = i;
         if (j > bmax) bmax = j;
     }
-    unsigned int xmin = (unsigned int)(bmin / 2);
-    unsigned int xmax = (unsigned int)(bmax / 2);
+    unsigned int xmin = (unsigned int)(bmin / fb_bytespp);
+    unsigned int xmax = (unsigned int)(bmax / fb_bytespp);
 
     /* remember what we're sending */
     for (unsigned int y = ymin; y <= ymax; y++) {
@@ -452,7 +484,7 @@ static void render_full(void)
 
     for (unsigned int y = 0; y < copy_h; y++) {
         size_t off = (size_t)y * finfo.line_length;
-        memcpy(prev_fb + off, fb_data + off, (size_t)copy_w * 2);
+        memcpy(prev_fb + off, fb_data + off, (size_t)copy_w * fb_bytespp);
     }
 
     st_conv_ms += t1 - t0;
@@ -521,7 +553,7 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("neodct_displayd v2 (panel %dx%d, %d Hz SPI, %d fps poll, %s)\n",
+    printf("neodct_displayd v2.1 (panel %dx%d, %d Hz SPI, %d fps poll, %s)\n",
            PANEL_W, PANEL_H, opt_speed, opt_fps,
            opt_full ? "full-frame" : "dirty-rect");
 
