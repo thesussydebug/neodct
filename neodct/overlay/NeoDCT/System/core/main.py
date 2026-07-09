@@ -836,6 +836,10 @@ class NeoDCT_UI:
             # No matrix key this cycle; continue to evdev fallback if available.
 
         if self.keypad_fd is None:
+            # With no evdev device AND no matrix backend, nothing above waited,
+            # so sleep out the timeout to avoid a 100% CPU busy-loop in wait_for_key().
+            if self.matrix_input is None:
+                time.sleep(max(0.0, timeout))
             return None
 
         try:
@@ -884,8 +888,11 @@ class NeoDCT_UI:
                     self.state = "HOME"
 
         elif code in (103, 108) and self.state == "HOME":
-            target = contact_manager.show_contact_selector(self, title="Select", btn_text="Call")
-            if target:
+            result = contact_manager.show_contact_selector(self, title="Select", btn_text="Call")
+            if result:
+                # show_contact_selector returns (contact_row, selection_index);
+                # contact_row is (id, name, number, speed_dial).
+                target, _ = result
                 number = target[2]
                 name = target[1]
                 self.modem.dial(number)
