@@ -6,7 +6,7 @@
             "count": 5,
             "prefix": "bat",
             "x": 210,
-            "y": 24,
+            "y": 40,
             "sim_val": 4,
             "custom_images": {
                 "0": "/NeoDCT/System/ui/resources/img/battery/bat-0.png",
