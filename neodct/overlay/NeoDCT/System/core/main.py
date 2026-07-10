@@ -19,7 +19,7 @@ from System.core.SettingsStorage import get_setting
 import importlib.util
 import sqlite3
 from System.core.ModemService import ModemService
-from System.core.CrashHandler import show_app_crash
+from System.core.CrashHandler import show_app_crash, log_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
 from System.core.ErrorScreen import show_alpha_security_notice_once
@@ -310,13 +310,14 @@ class Framebuffer:
         self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
         self._black = (0, 0, 0)
 
-        # Cache RGB565 lookup tables for fallback packing.
-        # These reduce Python work inside the hot pixel loop.
-        self._r565 = [(i & 0xF8) << 8 for i in range(256)]
-        self._g565 = [(i & 0xFC) << 3 for i in range(256)]
-        self._b565 = [(i >> 3) for i in range(256)]
-        self._rgb565_out = bytearray(self.size)
-        self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
+        # RGB565 fallback lookup tables + buffers are only needed on the
+        # 16bpp-without-"BGR;16" path; allocate them lazily so the common
+        # 32bpp / BGR;16 configs don't pin ~350 KB for nothing (64 MB device).
+        self._r565 = None
+        self._g565 = None
+        self._b565 = None
+        self._rgb565_out = None
+        self._rgb565_band_out = None
 
         # Detect the pixel conversion path ONCE (Pillow >= 11 removed the
         # "BGR;16" packer, which silently forced the slow Python loop).
@@ -339,7 +340,18 @@ class Framebuffer:
             print("[FB] WARNING: on hardware, ensure neodct_displayd v2.1+ runs "
                   "BEFORE the UI so the framebuffer is switched to 32bpp.")
 
+    def _ensure_565_fallback(self):
+        """Build the lookup tables and output buffers for the pure-Python
+        RGB565 pack on first use (16bpp fb without Pillow's BGR;16 packer)."""
+        if self._r565 is None:
+            self._r565 = [(i & 0xF8) << 8 for i in range(256)]
+            self._g565 = [(i & 0xFC) << 3 for i in range(256)]
+            self._b565 = [(i >> 3) for i in range(256)]
+            self._rgb565_out = bytearray(self.size)
+            self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
+
     def _pack_rgb565(self, src_bytes, out_buf):
+        self._ensure_565_fallback()
         r565 = self._r565
         g565 = self._g565
         b565 = self._b565
@@ -397,6 +409,7 @@ class Framebuffer:
                 if self._has_bgr16:
                     band = src.tobytes("raw", "BGR;16")
                 else:
+                    self._ensure_565_fallback()
                     src_bytes = src.tobytes()
                     used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
                     band = self._rgb565_band_out[:used]
@@ -420,6 +433,7 @@ class Framebuffer:
                 data = rgb_img.tobytes("raw", "BGR;16")
             else:
                 # Fallback for Pillow >= 11 builds: software-pack RGB565.
+                self._ensure_565_fallback()
                 out = self._rgb565_out
                 self._pack_rgb565(rgb_img.tobytes(), out)
                 data = out
@@ -679,20 +693,36 @@ class NeoDCT_UI:
             return None
             
             
-    def get_image(self, path):
+    IMAGE_CACHE_MAX = 32
+
+    def get_image(self, path, max_size=None):
+        """Load (and cache) an RGBA image.
+
+        max_size: optional int -- downscale so neither side exceeds it and
+        cache the SCALED copy under a separate key. Callers that only ever
+        draw an icon small (AppSelector, status icons) should pass this so
+        the cache holds ~KB thumbnails instead of full-size art; on 64 MB
+        the full-size icon set alone is ~1 MB of RGBA.
+        """
         if path.startswith("/home"):
             if "System" in path:
-                rel_path = path.split("NeoDCT")[-1] 
+                rel_path = path.split("NeoDCT")[-1]
                 clean_path = "/NeoDCT" + rel_path
             else: clean_path = path
         else: clean_path = path
 
-        if clean_path in self.image_cache:
-            return self.image_cache[clean_path]
-        
+        key = clean_path if max_size is None else f"{clean_path}@{int(max_size)}"
+        if key in self.image_cache:
+            return self.image_cache[key]
+
         try:
             img = Image.open(clean_path).convert("RGBA")
-            self.image_cache[clean_path] = img
+            if max_size is not None and (img.width > max_size or img.height > max_size):
+                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            # FIFO cap so the cache cannot grow without bound on 64 MB.
+            if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
+                self.image_cache.pop(next(iter(self.image_cache)))
+            self.image_cache[key] = img
             return img
         except: return None
 
@@ -744,20 +774,12 @@ class NeoDCT_UI:
                 val = max(0, min(max_idx, int(el.get("sim_val", max_idx))))
 
             custom_path = el.get("custom_images", {}).get(str(val))
+            vis_box = None
             if custom_path:
-                img = self.get_image(custom_path)
+                img = self._get_status_icon(custom_path)
                 if img:
-                    # Home layout coords are authored for a 240px-tall UI;
-                    # scale icon assets by height ratio so they don't clip.
-                    icon_scale = self.H / 240.0
-                    scaled_w = max(1, int(img.width * icon_scale))
-                    scaled_h = max(1, int(img.height * icon_scale))
-                    if (scaled_w, scaled_h) != img.size:
-                        img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
                     self.canvas.paste(img, (x, y), img)
-                    if bat_label is not None:
-                        vis = img.getbbox() or (0, 0, scaled_w, scaled_h)
-                        self._draw_status_label(bat_label, x, y, vis)
+                    vis_box = img.getbbox() or (0, 0, img.width, img.height)
             else:
                 step = max(3, int(self.W * 0.021))
                 for i in range(count):
@@ -765,8 +787,34 @@ class NeoDCT_UI:
                     color = "white" if i <= val else "#333333"
                     bx = x + (i * step)
                     self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
-                if bat_label is not None:
-                    self._draw_status_label(bat_label, x, y, (0, 0, count * step, 15))
+                vis_box = (0, 0, count * step, 15)
+
+            # Draw the '?' even when the sprite failed to load, so a missing
+            # asset can't silently hide the "no battery" state.
+            if bat_label is not None:
+                self._draw_status_label(bat_label, x, y, vis_box or (0, 0, 12, 15))
+
+    def _get_status_icon(self, path):
+        """Status-bar sprite, pre-scaled for this display height and cached.
+        Home layout coords are authored for a 240px-tall UI; icons scale by
+        height ratio so they don't clip. Caching the SCALED copy avoids a
+        LANCZOS resize on every frame of the home screen."""
+        icon_scale = self.H / 240.0
+        img = self.get_image(path)
+        if img is None:
+            return None
+        scaled_w = max(1, int(img.width * icon_scale))
+        scaled_h = max(1, int(img.height * icon_scale))
+        if (scaled_w, scaled_h) == img.size:
+            return img
+        skey = f"{path}@{scaled_w}x{scaled_h}"
+        cached = self.image_cache.get(skey)
+        if cached is None:
+            cached = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+            if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
+                self.image_cache.pop(next(iter(self.image_cache)))
+            self.image_cache[skey] = cached
+        return cached
 
     def _draw_status_label(self, text, icon_x, icon_y, vis_box):
         """Draw a small status value (e.g. battery '85%' or '?') just left of the
@@ -786,9 +834,16 @@ class NeoDCT_UI:
         elif self.home_layout:
             bg_path = self.home_layout.get("background")
             if bg_path:
-                bg = self.get_image(bg_path)
+                # Convert/resize once and keep the screen-sized copy;
+                # render_home runs every frame and a per-frame LANCZOS
+                # resize of a full-screen image is pure waste.
+                bg = getattr(self, "_home_bg", None)
+                if bg is None:
+                    bg = self.get_image(bg_path)
+                    if bg:
+                        bg = bg.convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
+                        self._home_bg = bg
                 if bg:
-                    bg = bg.convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
                     self.canvas.paste(bg, (0, 0))
             else:
                 self.draw.rectangle((0, 0, self.W, self.H), fill="black")
@@ -835,7 +890,7 @@ class NeoDCT_UI:
             app_name = app.get("name", "(unknown)")
             print(f"[OS] App crashed: {app_name} ({path})")
             traceback.print_exc()
-            show_app_crash(self)
+            show_app_crash(self, app_name=app_name, exc_info=sys.exc_info())
 
     def render_menu(self):
         try:
@@ -849,6 +904,7 @@ class NeoDCT_UI:
         except BaseException:
             print("[OS] Menu crashed")
             traceback.print_exc()
+            log_crash("menu", sys.exc_info())
         finally:
             # Always unwind menu state so one bad app/menu event cannot trap the core loop.
             self.state = "HOME"
@@ -960,6 +1016,7 @@ def run(fb):
         except BaseException:
             print("[CORE] Unhandled exception in main loop")
             traceback.print_exc()
+            log_crash("core-main-loop", sys.exc_info())
             time.sleep(0.1)
 
 if __name__ == "__main__":

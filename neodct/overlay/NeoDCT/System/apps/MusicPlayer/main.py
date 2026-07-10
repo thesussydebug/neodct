@@ -129,12 +129,17 @@ class MusicPlayer:
     def toggle_pause(self):
         if not self.current_process: return
 
-        if self.is_paused:
-            os.kill(self.current_process.pid, signal.SIGCONT)
+        # mpv can exit between our poll and this signal (track just ended);
+        # signalling a dead pid raises ProcessLookupError and crashes the app.
+        try:
+            if self.is_paused:
+                os.kill(self.current_process.pid, signal.SIGCONT)
+                self.is_paused = False
+            else:
+                os.kill(self.current_process.pid, signal.SIGSTOP)
+                self.is_paused = True
+        except (ProcessLookupError, OSError):
             self.is_paused = False
-        else:
-            os.kill(self.current_process.pid, signal.SIGSTOP)
-            self.is_paused = True
 
     def run_now_playing(self, filepath):
         screen_w = getattr(self.ui, "W", 240)
