@@ -1,12 +1,21 @@
 #!/bin/sh
 # NeoDCT display shim - only runs on hardware with the SPI panel
 [ -e /dev/spidev0.0 ] || exit 0
+
 case "$1" in
   start)
-    # Configure framebuffer resolution and color depth
-    fbset -xres 240 -yres 240 -depth 16
-    
-    /NeoDCT/System/hw/neodct_displayd > /dev/null 2>&1 &
+    # NOTE: no fbset here. neodct_displayd v2.2 owns the framebuffer
+    # mode: it forces 240x175 @ 32bpp (falling back to 16bpp) and
+    # places the band at the bottom of the 240x240 panel, top rows
+    # black. An fbset call would just be overridden -- or worse,
+    # win a race and put us back on the slow 16bpp Python path.
+    #
+    # Tunables (all optional):
+    #   --speed 60     SPI clock in MHz (default 20; you validated 60)
+    #   --yoff 65      panel row where the UI band starts (default 65)
+    #   --stats        5s perf reports in the log
+    /NeoDCT/System/hw/neodct_displayd --speed 60 \
+        > /var/log/neodct_displayd.log 2>&1 &
     ;;
   stop)
     killall neodct_displayd 2>/dev/null

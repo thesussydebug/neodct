@@ -35,6 +35,7 @@ if _NEODCT_ROOT not in sys.path:
 
 from System.hw.pcf8575_keypad import (  # noqa: E402
     I2CMatrixScanner,
+    PCF8575,
     DEFAULT_BUS,
     DEFAULT_ADDR,
     DEFAULT_ROW_PINS,
@@ -222,6 +223,81 @@ def test_mode(scanner, path):
     return 0
 
 
+def _bipartition(pairs):
+    """2-color the connection graph: one color class = rows, other = cols.
+    Returns (side_a, side_b, conflicts)."""
+    adj = {}
+    for a, b in pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    color = {}
+    conflicts = []
+    for start in sorted(adj):
+        if start in color:
+            continue
+        color[start] = 0
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            for nb in adj[node]:
+                if nb not in color:
+                    color[nb] = 1 - color[node]
+                    queue.append(nb)
+                elif color[nb] == color[node]:
+                    conflicts.append((node, nb))
+    side_a = sorted(p for p, c in color.items() if c == 0)
+    side_b = sorted(p for p, c in color.items() if c == 1)
+    return side_a, side_b, conflicts
+
+
+def discover_mode(bus, addr):
+    """Drive each of the 16 pins low in turn; a pressed key connects one
+    pin from each matrix side, so its pair reads low. Press EVERY key on
+    the keypad once (slowly), then Ctrl-C for the computed row/col split."""
+    chip = PCF8575(bus=bus, addr=addr)
+    pairs = set()
+    print("DISCOVER: press every key on the keypad once. Ctrl-C when done.")
+    print("(each press should print a pin pair; hold keys briefly)\n")
+    try:
+        last_seen = set()
+        while True:
+            seen = set()
+            for drive in range(16):
+                chip.write16(0xFFFF & ~(1 << drive))
+                time.sleep(0.0005)
+                v = chip.read16()
+                for bit in range(16):
+                    if bit != drive and not (v >> bit) & 1:
+                        seen.add((min(drive, bit), max(drive, bit)))
+            chip.write16(0xFFFF)
+            for p in seen - last_seen:
+                marker = "" if p not in pairs else " (already known)"
+                print(f"  connection: P{p[0]} <-> P{p[1]}{marker}")
+            pairs |= seen
+            last_seen = seen
+            time.sleep(0.03)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        chip.close()
+
+    print(f"\n{len(pairs)} distinct key connections observed.")
+    if not pairs:
+        print("no connections seen -- check wiring/pull-ups and press harder.")
+        return 1
+
+    side_a, side_b, conflicts = _bipartition(pairs)
+    if conflicts:
+        print("WARNING: connections conflict with a clean matrix split "
+              f"(e.g. {conflicts[0]}). A wire may be loose or two keys were "
+              "pressed at once. Re-run and press one key at a time.")
+    print(f"\nsuggested split (either assignment works):")
+    print(f"  --rows {','.join(map(str, side_a))} --cols {','.join(map(str, side_b))}")
+    print(f"\nnext: python3 {sys.argv[0]} --bus {bus} "
+          f"--rows {','.join(map(str, side_a))} --cols {','.join(map(str, side_b))}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="console PCF8575 keymap builder")
     ap.add_argument("--bus", type=int, default=DEFAULT_BUS)
@@ -233,10 +309,17 @@ def main():
     ap.add_argument("--output", default=DEFAULT_OUTPUT)
     ap.add_argument("--test", action="store_true",
                     help="verify an existing keymap instead of capturing")
+    ap.add_argument("--discover", action="store_true",
+                    help="find which expander pins the keypad uses and "
+                         "compute the row/col split (press every key once)")
     args = ap.parse_args()
 
-    print(f"PCF8575 @ /dev/i2c-{args.bus} addr 0x{args.addr:02X} "
-          f"rows={args.rows} cols={args.cols}")
+    print(f"PCF8575 @ /dev/i2c-{args.bus} addr 0x{args.addr:02X}")
+
+    if args.discover:
+        return discover_mode(args.bus, args.addr)
+
+    print(f"rows={args.rows} cols={args.cols}")
 
     try:
         scanner = I2CMatrixScanner(args.rows, args.cols,
