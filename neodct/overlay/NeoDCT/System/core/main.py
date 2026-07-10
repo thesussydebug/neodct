@@ -441,7 +441,10 @@ def init_databases():
         pb_file = f"{db_path}/phonebook.db"
         conn = sqlite3.connect(pb_file)
         c = conn.cursor()
-        
+        # WAL hardening so the database is not corrupted by a power loss mid-write.
+        # Every later connection like Phonebook and Messages uses WAL automagically!!! (hopefully)
+        c.execute("PRAGMA journal_mode=WAL")
+
         c.execute('''CREATE TABLE IF NOT EXISTS contacts
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                       name TEXT, 
@@ -461,6 +464,7 @@ def init_databases():
         inbox_file = f"{db_path}/sms_inbox.db"
         conn = sqlite3.connect(inbox_file)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute('''CREATE TABLE IF NOT EXISTS inbox
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       message TEXT,
@@ -474,6 +478,7 @@ def init_databases():
         outbox_file = f"{db_path}/sms_outbox.db"
         conn = sqlite3.connect(outbox_file)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute('''CREATE TABLE IF NOT EXISTS outbox
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       message TEXT,
