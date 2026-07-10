@@ -23,6 +23,7 @@ from System.core.CrashHandler import show_app_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
 from System.core.ErrorScreen import show_alpha_security_notice_once
+from System.hw import battery
 
 # --- CONFIG ---
 # 1. Allow loading images even if they are missing EOF markers
@@ -715,7 +716,24 @@ class NeoDCT_UI:
             self.draw.text((x, y), text, font=font, fill=el["color"])
 
         elif el["type"] == "icon_set":
-            val = 3 
+            count = el.get("count", 5)
+            max_idx = max(0, count - 1)
+            prefix = el.get("prefix")
+
+            # Battery reflects the real charge; other indicators (e.g. signal)
+            # fall back to their authored sim value until wired to real data.
+            bat_label = None
+            if prefix == "bat":
+                percent = battery.read_percent()
+                if percent is None:
+                    val = 0            # empty icon when no battery is detected
+                    bat_label = "?"
+                else:
+                    val = max(0, min(max_idx, round(percent / 100.0 * max_idx)))
+                    bat_label = f"{percent}%"
+            else:
+                val = max(0, min(max_idx, int(el.get("sim_val", max_idx))))
+
             custom_path = el.get("custom_images", {}).get(str(val))
             x = int((el["x"] / 240.0) * self.W)
             y = int((el["y"] / 240.0) * self.H)
@@ -730,13 +748,29 @@ class NeoDCT_UI:
                     if (scaled_w, scaled_h) != img.size:
                         img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
                     self.canvas.paste(img, (x, y), img)
+                    if bat_label is not None:
+                        vis = img.getbbox() or (0, 0, scaled_w, scaled_h)
+                        self._draw_status_label(bat_label, x, y, vis)
             else:
-                for i in range(el["count"]):
+                step = max(3, int(self.W * 0.021))
+                for i in range(count):
                     h = (i + 1) * 3
                     color = "white" if i <= val else "#333333"
-                    step = max(3, int(self.W * 0.021))
                     bx = x + (i * step)
                     self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
+                if bat_label is not None:
+                    self._draw_status_label(bat_label, x, y, (0, 0, count * step, 15))
+
+    def _draw_status_label(self, text, icon_x, icon_y, vis_box):
+        """Draw a small status value (e.g. battery '85%' or '?') just left of the
+        icon's visible (opaque) region, vertically centered on it. Aligning to
+        the opaque box -- not the full sprite -- keeps it next to a battery
+        graphic that only fills the lower part of a tall image."""
+        left, top, right, bottom = vis_box
+        tw, th = self.get_text_size(text, self.font_s)
+        tx = max(0, icon_x + left - tw - 4)
+        ty = icon_y + top + max(0, ((bottom - top) - th) // 2)
+        self.draw.text((tx, ty), text, font=self.font_s, fill="white")
 
     def render_home(self):
         # 1. Background Logic
