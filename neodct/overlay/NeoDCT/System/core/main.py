@@ -717,68 +717,51 @@ class NeoDCT_UI:
 
         elif el["type"] == "icon_set":
             prefix = el.get("prefix")
+            count = el.get("count", 5)
+            max_idx = max(0, count - 1)
             x = int((el["x"] / 240.0) * self.W)
             y = int((el["y"] / 240.0) * self.H)
 
+            # Battery uses the level sprites ("bars"). The charge level drives
+            # which sprite shows, but the percentage number stays in the backend
+            # (battery.read_percent()) and is NOT drawn near the icon -- only a
+            # '?' appears when no gauge is detected.
+            bat_label = None
             if prefix == "bat":
-                # Battery is drawn (not a sprite) so charge fills inside the
-                # body instead of stacking bars above it.
-                self._render_battery(x, y)
-            else:
-                # Other indicators (e.g. signal) keep their authored sprite /
-                # sim value until wired to real data.
-                count = el.get("count", 5)
-                max_idx = max(0, count - 1)
-                val = max(0, min(max_idx, int(el.get("sim_val", max_idx))))
-                custom_path = el.get("custom_images", {}).get(str(val))
-                if custom_path:
-                    img = self.get_image(custom_path)
-                    if img:
-                        # Home layout coords are authored for a 240px-tall UI;
-                        # scale icon assets by height ratio so they don't clip.
-                        icon_scale = self.H / 240.0
-                        scaled_w = max(1, int(img.width * icon_scale))
-                        scaled_h = max(1, int(img.height * icon_scale))
-                        if (scaled_w, scaled_h) != img.size:
-                            img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
-                        self.canvas.paste(img, (x, y), img)
+                percent = battery.read_percent()
+                if percent is None:
+                    val = 0
+                    bat_label = "?"
                 else:
-                    step = max(3, int(self.W * 0.021))
-                    for i in range(count):
-                        h = (i + 1) * 3
-                        color = "white" if i <= val else "#333333"
-                        bx = x + (i * step)
-                        self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
+                    val = max(0, min(max_idx, round(percent / 100.0 * max_idx)))
+            else:
+                # Other indicators (e.g. signal) use their authored sim value.
+                val = max(0, min(max_idx, int(el.get("sim_val", max_idx))))
 
-    def _render_battery(self, x, y):
-        """Draw a vertical battery whose body fills from the bottom in
-        proportion to the real charge, with the percentage (or '?' when no
-        gauge is detected) shown to its left."""
-        percent = battery.read_percent()
-        text = "?" if percent is None else f"{percent}%"
-        frac = 0.0 if percent is None else max(0.0, min(1.0, percent / 100.0))
-
-        body_w, body_h = 22, 42
-        cap_w, cap_h = 10, 4
-        outline = 2
-        cap_x = x + (body_w - cap_w) // 2
-        body_y = y + cap_h
-
-        # Terminal cap + body outline.
-        self.draw.rectangle((cap_x, y, cap_x + cap_w, body_y), fill="white")
-        self.draw.rectangle((x, body_y, x + body_w, body_y + body_h),
-                            outline="white", width=outline)
-
-        # Fill the interior from the bottom up.
-        inset = outline + 1
-        ix0, ix1 = x + inset, x + body_w - inset
-        iy_bottom, iy_top = body_y + body_h - inset, body_y + inset
-        fill_h = int(round((iy_bottom - iy_top) * frac))
-        if fill_h > 0:
-            self.draw.rectangle((ix0, iy_bottom - fill_h, ix1, iy_bottom), fill="white")
-
-        # Percentage / '?' to the left, centered on the body.
-        self._draw_status_label(text, x, body_y, (0, 0, body_w, body_h))
+            custom_path = el.get("custom_images", {}).get(str(val))
+            if custom_path:
+                img = self.get_image(custom_path)
+                if img:
+                    # Home layout coords are authored for a 240px-tall UI;
+                    # scale icon assets by height ratio so they don't clip.
+                    icon_scale = self.H / 240.0
+                    scaled_w = max(1, int(img.width * icon_scale))
+                    scaled_h = max(1, int(img.height * icon_scale))
+                    if (scaled_w, scaled_h) != img.size:
+                        img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+                    self.canvas.paste(img, (x, y), img)
+                    if bat_label is not None:
+                        vis = img.getbbox() or (0, 0, scaled_w, scaled_h)
+                        self._draw_status_label(bat_label, x, y, vis)
+            else:
+                step = max(3, int(self.W * 0.021))
+                for i in range(count):
+                    h = (i + 1) * 3
+                    color = "white" if i <= val else "#333333"
+                    bx = x + (i * step)
+                    self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
+                if bat_label is not None:
+                    self._draw_status_label(bat_label, x, y, (0, 0, count * step, 15))
 
     def _draw_status_label(self, text, icon_x, icon_y, vis_box):
         """Draw a small status value (e.g. battery '85%' or '?') just left of the
