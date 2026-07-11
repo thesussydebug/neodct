@@ -1,0 +1,8 @@
+config BR2_PACKAGE_PYTHON_MINIAUDIO
+	bool "python-miniaudio"
+	select BR2_PACKAGE_PYTHON_CFFI # runtime
+	help
+	  python bindings for the miniaudio library and its decoders
+	  (mp3, flac, ogg vorbis, wav).
+
+	  https://github.com/irmen/pyminiaudio

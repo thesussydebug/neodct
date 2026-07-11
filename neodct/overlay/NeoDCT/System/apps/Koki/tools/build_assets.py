@@ -11,7 +11,7 @@ pre-rendered, pre-scaled assets into `<app>/assets/`:
 - Sounds: tracks >= 15s become mono 2205kHz 64kbps MP3 (music, looped via
   mpv); shorter ones become 22050 Hz mono 16-bit WAV (sfx).
 
-Requires: rsvg-convert, ffmpeg, Pillow.
+Requires: rsvg-convert, ffmpeg, imagemagick.
 Usage: python3 tools/build_assets.py
 """
 
@@ -37,6 +37,7 @@ IMG_OUT = os.path.join(OUT, "img")
 SND_OUT = os.path.join(OUT, "snd")
 
 STAGE_SCALE = 0.5          # 480x360 -> 240x180 (cropped to 175)
+SCREEN_W, SCREEN_H = 240, 175
 MUSIC_THRESHOLD_S = 15.0   # >= this = music (mp3), below = sfx (wav)
 
 # Sprites whose size changes at runtime get baked at their largest used size
@@ -45,6 +46,12 @@ BAKE_SIZE_OVERRIDE = {
     "intro": 100,        # logo grows to 100%
     "StartButton": 85,   # pulses 70 -> 85
 }
+
+# Full-screen overlays that scripts never move, scale, or flip: their art is
+# cropped to the visible screen window at bake time. Sprite2's six score
+# screens are 633x704 (1.7MB decoded EACH) with only 240x175 ever on screen;
+# uncropped they were half the game's decoded-image weight.
+SCREEN_CROP_STATIC = {"Sprite2", "Dynaris Logo", "White", "GameOver"}
 
 
 def run(cmd):
@@ -85,6 +92,25 @@ def alpha_bbox(path):
     if w < 3 or h < 3:      # uniform/opaque image: trim collapsed
         return None
     return [x, y, x + w, y + h]
+
+
+def crop_to_screen(path, pose_x, pose_y, cx, cy):
+    """Crop a static overlay costume to the screen window (+1px slack for
+    the engine's paste rounding) and return the adjusted rotation center."""
+    res = subprocess.run(["magick", "identify", "-format", "%w %h", path],
+                         capture_output=True, text=True)
+    w, h = map(int, res.stdout.split())
+    px = SCREEN_W / 2.0 + pose_x * STAGE_SCALE - cx    # paste origin on screen
+    py = SCREEN_H / 2.0 - pose_y * STAGE_SCALE - cy
+    lx0 = max(0, int(-px) - 1)
+    ly0 = max(0, int(-py) - 1)
+    lx1 = min(w, int(SCREEN_W - px) + 2)
+    ly1 = min(h, int(SCREEN_H - py) + 2)
+    if (lx0, ly0, lx1, ly1) == (0, 0, w, h):
+        return cx, cy
+    run(["magick", path, "-crop", f"{lx1 - lx0}x{ly1 - ly0}+{lx0}+{ly0}",
+         "+repage", "PNG32:" + path])
+    return cx - lx0, cy - ly0
 
 
 def convert_sound(md5ext, duration_s):
@@ -132,23 +158,41 @@ def main():
         for c in t.get("costumes", []):
             res = c.get("bitmapResolution", 1) or 1
             scale = STAGE_SCALE * (size_pct / 100.0) / res
-            key = (c["md5ext"], round(scale, 4))
-            if key not in rendered:
-                fname = f"{os.path.splitext(c['md5ext'])[0]}@{round(scale*10000)}.png"
+            cx = c.get("rotationCenterX", 0) * scale
+            cy = c.get("rotationCenterY", 0) * scale
+            if name in SCREEN_CROP_STATIC:
+                # per-target file (crop depends on this sprite's pose)
+                fname = (f"{os.path.splitext(c['md5ext'])[0]}"
+                         f"@{round(scale*10000)}c.png")
                 dst = os.path.join(IMG_OUT, fname)
                 try:
                     render_costume(c["md5ext"], scale, dst)
+                    cx, cy = crop_to_screen(
+                        dst, entry["x"], entry["y"], cx, cy)
                 except Exception as e:
                     print(f"  !! {name}/{c['name']}: {e}")
                     continue
-                rendered[key] = fname
                 bboxes[fname] = alpha_bbox(dst)
+            else:
+                key = (c["md5ext"], round(scale, 4))
+                if key not in rendered:
+                    fname = (f"{os.path.splitext(c['md5ext'])[0]}"
+                             f"@{round(scale*10000)}.png")
+                    dst = os.path.join(IMG_OUT, fname)
+                    try:
+                        render_costume(c["md5ext"], scale, dst)
+                    except Exception as e:
+                        print(f"  !! {name}/{c['name']}: {e}")
+                        continue
+                    rendered[key] = fname
+                    bboxes[fname] = alpha_bbox(dst)
+                fname = rendered[key]
             entry["costumes"].append({
                 "name": c["name"],
-                "img": "img/" + rendered[key],
-                "cx": c.get("rotationCenterX", 0) * scale,
-                "cy": c.get("rotationCenterY", 0) * scale,
-                "bbox": bboxes.get(rendered[key]),
+                "img": "img/" + fname,
+                "cx": cx,
+                "cy": cy,
+                "bbox": bboxes.get(fname),
             })
 
         for s in t.get("sounds", []):
