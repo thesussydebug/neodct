@@ -254,7 +254,13 @@ def discover_mode(bus, addr):
     """Drive each of the 16 pins low in turn; a pressed key connects one
     pin from each matrix side, so its pair reads low. Press EVERY key on
     the keypad once (slowly), then Ctrl-C for the computed row/col split."""
-    chip = PCF8575(bus=bus, addr=addr)
+    try:
+        chip = PCF8575(bus=bus, addr=addr)
+    except Exception as exc:
+        print(f"scanner init failed: {exc}")
+        print("check: device exists (ls /dev/i2c-*), chip visible "
+              f"(i2cdetect -y {bus}), pull-ups on SDA/SCL.")
+        return 1
     pairs = set()
     print("DISCOVER: press every key on the keypad once. Ctrl-C when done.")
     print("(each press should print a pin pair; hold keys briefly)\n")

@@ -78,6 +78,10 @@ class Input:
                     data = os.read(fd, 24)
                 except Exception:
                     break
+                if not data:
+                    # EOF: select() reports the fd readable forever, so
+                    # 'continue' would busy-loop the whole single-core OS.
+                    break
                 if len(data) == 24:
                     _, _, etype, code, val = struct.unpack("llHHI", data)
                 elif len(data) == 16:
@@ -106,6 +110,12 @@ class Input:
                 code = m.read_key(0)
             except Exception:
                 code = None
+                # I2C error: the backend's _held is stale, so our latched
+                # key would stay logically held forever (phantom drift).
+                # Drop the latch; a healthy scan re-establishes it.
+                if self._matrix_code is not None:
+                    self.held.discard(self._matrix_code)
+                    self._matrix_code = None
             if code is not None:
                 name = KEYMAP.get(code)
                 if name:
@@ -520,8 +530,17 @@ class Engine:
                       "using reduced cache budgets")
         except Exception:
             pass
-        img_kb = int(os.environ.get("NEODCT_KOKI_IMG_CACHE_KB", img_default))
-        fx_kb = int(os.environ.get("NEODCT_KOKI_FX_CACHE_KB", fx_default))
+        def _env_kb(name, default):
+            raw = os.environ.get(name, "")
+            try:
+                value = int(raw) if raw else int(default)
+            except ValueError:
+                print(f"[Koki] ignoring invalid {name}={raw!r}; using {default} KB")
+                return int(default)
+            return value if value > 0 else int(default)
+
+        img_kb = _env_kb("NEODCT_KOKI_IMG_CACHE_KB", img_default)
+        fx_kb = _env_kb("NEODCT_KOKI_FX_CACHE_KB", fx_default)
         self._img_cache = LRUImages(img_kb * 1024)   # path -> RGBA
         self._fx_cache = LRUImages(fx_kb * 1024)     # (path,size,flip,fx) -> img
         self._mask_cache = LRUImages(256 * 1024)     # (path,flip) -> alpha L
@@ -767,10 +786,16 @@ class Engine:
         d.text((45, 62), "Quit Koki?", font=ui.font_n, fill="white")
         d.text((45, 90), "Enter=Yes  C=No", font=ui.font_s, fill="white")
         ui.fb.update(self.canvas)
-        # swallow the held back key first
+        # swallow the held back key first (bounded: if the input device dies
+        # while the key is held, its release never arrives and this loop
+        # would otherwise spin forever)
+        deadline = time.monotonic() + 1.0
         while self.input.key("back"):
             self.input.poll()
             time.sleep(0.02)
+            if time.monotonic() >= deadline:
+                self.input.held.discard("back")
+                break
         while True:
             self.input.poll()
             if "enter" in self.input.pressed:
@@ -783,11 +808,13 @@ class Engine:
     def run(self):
         if self.headless_frames is not None:
             self._vtime = 0.0  # virtual clock must exist before any script runs
-        self.start_flag()
         frames = 0
         busy_acc = 0.0
         t_report = _now()
         try:
+            # inside the try: flag handlers can start music, and an exception
+            # here must still reach teardown() or the mpv child leaks.
+            self.start_flag()
             while not self.quit:
                 t0 = _now()
                 self.input.poll()
