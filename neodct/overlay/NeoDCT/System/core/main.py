@@ -219,7 +219,8 @@ class MatrixKeypadInput:
         self.matrix_to_code = dict(cfg["matrix_to_code"])
         self.rows = [OutputDevice(pin, initial_value=True) for pin in self.row_pins]
         self.cols = [Button(pin, pull_up=True) for pin in self.col_pins]
-        self._held = None
+        self._held = set()
+        self._pending = []
         self._last_unmapped = None
 
     def close(self):
@@ -239,26 +240,28 @@ class MatrixKeypadInput:
                 pass
 
     def _scan_once(self):
-        pressed = None
+        # Full-matrix scan with per-key edge detection, so a second key
+        # pressed while another is held is still reported (key rollover).
+        current = set()
         for row_idx, row in enumerate(self.rows):
             row.off()
             time.sleep(0.001)
             for col_idx, col in enumerate(self.cols):
                 if col.is_pressed:
-                    pressed = (row_idx, col_idx)
-                    break
+                    current.add((row_idx, col_idx))
             row.on()
-            if pressed is not None:
-                break
 
-        if pressed is None:
-            self._held = None
-            self._last_unmapped = None
+        new_presses = sorted(current - self._held)
+        self._held = current
+        if new_presses:
+            self._pending.extend(new_presses[1:])
+            pressed = new_presses[0]
+        elif self._pending:
+            pressed = self._pending.pop(0)
+        else:
+            if not current:
+                self._last_unmapped = None
             return None
-
-        if pressed == self._held:
-            return None
-        self._held = pressed
 
         code = self.matrix_to_code.get(pressed)
         if code is None:
@@ -1001,6 +1004,15 @@ class NeoDCT_UI:
             self.state = "HOME_DIALING"
 
 def run(fb):
+    # First boot with an i2c keypad but no keymap: run the on-screen setup
+    # wizard (it exec-restarts the UI after saving, so it may not return).
+    try:
+        from System.hw.i2c_keypad_setup import maybe_run_first_time_setup
+        maybe_run_first_time_setup(fb)
+    except Exception:
+        print("[SETUP] First-time keypad setup failed; continuing boot.")
+        traceback.print_exc()
+
     ui = NeoDCT_UI(fb)
     print("[CORE] Entering Main Loop...")
 

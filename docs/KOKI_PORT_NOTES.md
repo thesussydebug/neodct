@@ -202,3 +202,77 @@ only. If the ISP reserved memory is ever reclaimed in the device tree
   cannonballs/dives, Enemy2 cycle-2 pace. Set to 1.0 for original speeds.
 - sb3 source moved out of the repo; build_assets.py now also looks in
   ~/Downloads/Koki/resources/app/koki.sb3 files/.
+
+### Memory round (2026-07-10, after the CMA fix -> 53MB usable)
+
+Measured with tools/harness-based probe: full playthrough peaked ~13.7MB
+over baseline with a +5MB RSS spike at the ending. Root cause: Sprite2's
+six score screens were baked at 633x704 (1.7MB decoded EACH -- more than
+half the game's 18.9MB decoded-image pool) though only 240x175 shows.
+
+- build_assets.py: SCREEN_CROP_STATIC crops never-moved full-screen
+  overlays (Sprite2, Dynaris Logo, White, GameOver) to the visible window
+  at bake time, adjusting rotation centers. Decoded pool: 18.9MB -> 8.6MB;
+  largest single decode: 1740KB -> 169KB. Sprite1 (controls panel) glides,
+  so it stays uncropped. Rebuild assets when changing this.
+- engine cache tiers by MemTotal: <40MB -> 1024/384KB, <72MB -> 1536/512KB
+  (covers the 53MB Luckfox and 64MB QEMU), else 3072/1024KB. Env overrides
+  unchanged.
+- Backdrops decode directly to RGB (no longer evict sprites from the RGBA
+  img cache); brightness/ghost use one point() LUT instead of split/merge
+  (5 fewer full-size temporaries per variant); PNG file handles closed via
+  context manager.
+- teardown() calls malloc_trim(0) (glibc; harmless no-op elsewhere) so the
+  freed heap actually returns to the kernel when the game exits.
+- SoundManager prefers small players when installed: aplay for WAV sfx,
+  mpg123 for MP3 music, mpv as fallback. mpv's RSS is tens of MB -- on a
+  64MB system it can cause the OOM by itself. (aplay/mpg123 are NOT in the
+  buildroot config yet; BR2_PACKAGE_ALSA_UTILS(+APLAY) / BR2_PACKAGE_MPG123
+  if wanted later.)
+
+Probe after: full playthrough flat at ~8.4MB over baseline (5.8MB with
+device-tier budgets), ending spike gone, teardown returns to baseline with
+0 live images. Render perf unchanged (~0.2ms/frame host).
+
+### Sound player revert (2026-07-10)
+
+Mixing aplay (sfx) / mpg123 (music) alongside each other fights over QEMU's
+emulated ALSA device: music glitches, stutter-"restarts", plays fast. A
+harness trace proved the game logic never re-triggers music on movement --
+it's purely player-level device contention. Reverted to the known-good
+all-mpv default; aplay/mpg123 remain opt-in for real hardware via
+NEODCT_KOKI_WAV_PLAYER / NEODCT_KOKI_MP3_PLAYER.
+
+mpv memory reality check (measured): demuxer/cache flags do NOT shrink it
+(our tracks are <1MiB whole files); ~24MB private per process on a desktop
+build is codec/core init. The added flags (--no-config, --load-scripts=no,
+--audio-display=no, small demuxer buffers) are kept as harmless trims. The
+real lever is process count: on systems under 72MB RAM with mpv as the sfx
+player, MAX_SFX drops 3 -> 1 (worst case = music + 1 sfx). Also note only
+one looped track is a WAV ("Koki D score", 14.46s, under the builder's 15s
+music threshold) -- looped WAVs route to mpv since aplay cannot loop.
+
+Final sound config (2026-07-10, after QEMU tuning at 72MB VM / 55MB usable):
+sfx=aplay (millisecond startup, trivial RSS -- mpv-per-sfx had audible
+delay and 2+ concurrent mpv OOM'd the VM), music=mpv (deep buffering
+survives aplay device-sharing; mpg123 music did not). Defaults pick this
+automatically when aplay is installed; NEODCT_KOKI_WAV_PLAYER /
+NEODCT_KOKI_MP3_PLAYER / NEODCT_KOKI_MAX_SFX override. Watchdog logs
+"music player died (rc=...)" if the OOM killer eats the music process.
+
+### miniaudio backend (2026-07-10, the actual fix)
+
+python-miniaudio replaces the external-player zoo: one PlaybackDevice,
+all sounds decoded (dr_mp3/dr_wav built in, resampled to 22050 mono s16)
+and mixed IN-PROCESS on the audio thread. Kills every problem at once:
+no spawn latency (sfx were delayed by mpv's per-process init), one ALSA
+client (no device contention -- the aplay/mpg123 music glitches), and
+kilobytes of RAM instead of ~24MB private per mpv. Mixing uses audioop
+when the stdlib still has it (< 3.13), else a pure-python saturating add
+(0.6ms per 150ms chunk at 3 voices on host -- fine even under TCG).
+
+SoundManager auto-selects: miniaudio if importable -> external players
+-> silent. NEODCT_KOKI_AUDIO=subprocess|miniaudio forces a backend;
+NEODCT_KOKI_ABUF_MS tunes device buffer (default 150). The subprocess
+chain and all its env knobs remain as the fallback. python-miniaudio is
+pip-installed on the user's QEMU VM (not yet a buildroot package).

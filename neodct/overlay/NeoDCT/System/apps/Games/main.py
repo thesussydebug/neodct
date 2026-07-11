@@ -1,248 +1,104 @@
 import os
-import random
-import select
-import struct
-import time
+import sys
 
-from System.ui.framework import SoftKeyBar
+# Apps are loaded by importlib under the name "neodct_app", so sibling
+# modules need this directory on sys.path.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
 
-# Input codes (Linux input layer)
-KEY_UP = 103
-KEY_DOWN = 108
-KEY_LEFT = 105
-KEY_RIGHT = 106
-KEY_ENTER = 28
-KEY_MENU = 50   # Key 'm'
-KEY_BACK = 14   # Backspace (as mapped in your VM)
+from System.ui.framework import (
+    SoftKeyBar,
+    VerticalList,
+    LevelSelector,
+    TextScroller,
+    InfoScreen,
+)
 
-# Number keys on classic keypad
-KEY_NUM_2 = 3
-KEY_NUM_4 = 5
-KEY_NUM_6 = 7
-KEY_NUM_8 = 9
+from games_common import APP_ID, get_setting_int, set_setting_value
+from snake import SnakeGame
+from memory import MemoryGame
 
-# Display + board sizing
-GRID_W = 20
-GRID_H = 14
+SNAKE_LEVEL_KEY = "games.snake.level"
+SNAKE_TOP_KEY = "games.snake.topscore"
+MEMORY_TOP_KEY = "games.memory.topscore"
 
-KEYPAD_PATH = "/dev/input/event0"
+SNAKE_MENU = ["New game", "Level", "Top score", "Instructions"]
+MEMORY_MENU = ["New game", "Top score", "Instructions"]
 
-class SnakeGame:
-    def __init__(self, ui):
-        self.ui = ui
-        self.softkey = SoftKeyBar(ui)
-        self.keypad_fd = None
-        self.screen_w = getattr(ui, "W", 240)
-        self.screen_h = getattr(ui, "H", 175)
-        self.softkey_h = getattr(ui, "SOFTKEY_H", 30)
-        self.content_bottom = getattr(ui, "content_bottom", self.screen_h - self.softkey_h)
-        self._compute_layout()
-        self.reset()
+SNAKE_INSTRUCTIONS = (
+    "Feed the snake by steering it to the food. Every bite makes it grow "
+    "longer. Use keys 2, 4, 6 and 8 to change direction. The game ends if "
+    "the snake runs into the walls or into its own body. A higher level "
+    "means more speed and more points for each bite."
+)
 
-    def _compute_layout(self):
-        self.header_h = max(28, int(self.screen_h * 0.10))
-        content_top = self.header_h + 6
-        usable_h = max(1, self.content_bottom - content_top - 2)
-        max_cell_w = max(1, (self.screen_w - 4) // GRID_W)
-        max_cell_h = max(1, usable_h // GRID_H)
-        self.cell = max(4, min(max_cell_w, max_cell_h))
+MEMORY_INSTRUCTIONS = (
+    "All the cards lie face down. Move the cursor with keys 2, 4, 6 and 8 "
+    "and turn a card over with key 5. Two matching cards are cleared from "
+    "the board. Find every pair to finish the game. The fewer tries you "
+    "need, the higher your score."
+)
 
-        self.board_w = GRID_W * self.cell
-        self.board_h = GRID_H * self.cell
-        self.board_x = max(0, (self.screen_w - self.board_w) // 2)
-        self.board_top = content_top + max(0, (usable_h - self.board_h) // 2)
-        self.board_bottom = self.board_top + self.board_h
 
-    def reset(self):
-        cx, cy = GRID_W // 2, GRID_H // 2
-        self.snake = [(cx, cy - 1), (cx, cy), (cx, cy + 1)]
-        self.direction = (0, -1)
-        self.next_direction = self.direction
-        self.score = 0
-        random.seed(time.time())
-        self.spawn_food()
-        self.render()
+def _show_menu(ui, title, items):
+    menu = VerticalList(ui, title, items, app_id=APP_ID)
+    SoftKeyBar(ui).update("Select", present=False)
+    return menu.show()
 
-    def ensure_keypad(self):
-        if self.keypad_fd is not None: return self.keypad_fd
-        if hasattr(self.ui, "keypad_fd"):
-            self.keypad_fd = self.ui.keypad_fd
-            return self.keypad_fd
-        try:
-            self.keypad_fd = os.open(KEYPAD_PATH, os.O_RDONLY | os.O_NONBLOCK)
-        except Exception:
-            self.keypad_fd = None
-        return self.keypad_fd
 
-    def poll_key(self, timeout):
-        if hasattr(self.ui, "read_keypress"):
-            try:
-                return self.ui.read_keypress(timeout)
-            except Exception:
-                pass
+def _finish_game(ui, score, top_key):
+    """Shared end-of-game flow: show score, update the stored top score."""
+    if score is None:
+        return
+    top = get_setting_int(top_key, 0)
+    if score > top:
+        set_setting_value(top_key, score)
+        InfoScreen(ui, "New top score:", score, softkey_text="OK").show()
+    else:
+        InfoScreen(ui, "Game over! Score:", score, softkey_text="OK").show()
 
-        fd = self.ensure_keypad()
-        if fd is None:
-            time.sleep(timeout)
-            return None
 
-        r, _, _ = select.select([fd], [], [], timeout)
-        if not r: return None
+def snake_menu(ui):
+    while True:
+        choice = _show_menu(ui, "Snake", SNAKE_MENU)
+        if choice < 0:
+            return
+        if choice == 0:
+            level = get_setting_int(SNAKE_LEVEL_KEY, 5)
+            score = SnakeGame(ui, level).play()
+            _finish_game(ui, score, SNAKE_TOP_KEY)
+        elif choice == 1:
+            current = get_setting_int(SNAKE_LEVEL_KEY, 5)
+            picked = LevelSelector(ui, current=current, app_id=APP_ID).show()
+            if picked is not None:
+                set_setting_value(SNAKE_LEVEL_KEY, picked)
+        elif choice == 2:
+            InfoScreen(ui, "Top score", get_setting_int(SNAKE_TOP_KEY, 0)).show()
+        elif choice == 3:
+            TextScroller(ui, SNAKE_INSTRUCTIONS).show()
 
-        try:
-            data = os.read(fd, 24)
-            # Handle both 32-bit (16 byte) and 64-bit (24 byte) input events
-            if len(data) == 24:
-                _, _, etype, code, val = struct.unpack("llHHI", data)
-            elif len(data) == 16:
-                _, _, etype, code, val = struct.unpack("IIHHI", data)
-            else:
-                return None
-        except Exception:
-            return None
 
-        if etype == 1 and val == 1: # EV_KEY, Key Press
-            return code
-        return None
+def memory_menu(ui):
+    while True:
+        choice = _show_menu(ui, "Memory", MEMORY_MENU)
+        if choice < 0:
+            return
+        if choice == 0:
+            score = MemoryGame(ui).play()
+            _finish_game(ui, score, MEMORY_TOP_KEY)
+        elif choice == 1:
+            InfoScreen(ui, "Top score", get_setting_int(MEMORY_TOP_KEY, 0)).show()
+        elif choice == 2:
+            TextScroller(ui, MEMORY_INSTRUCTIONS).show()
 
-    def direction_from_key(self, key):
-        if key in (KEY_UP, KEY_NUM_2): return (0, -1)
-        if key in (KEY_DOWN, KEY_NUM_8): return (0, 1)
-        if key in (KEY_LEFT, KEY_NUM_4): return (-1, 0)
-        if key in (KEY_RIGHT, KEY_NUM_6): return (1, 0)
-        return None
-
-    def tick_delay(self):
-        return 0.15
-
-    def spawn_food(self):
-        open_cells = [(x, y) for x in range(GRID_W) for y in range(GRID_H) if (x, y) not in self.snake]
-        self.food = random.choice(open_cells) if open_cells else None
-
-    def step(self):
-        self.direction = self.next_direction
-        hx, hy = self.snake[0]
-        nx, ny = hx + self.direction[0], hy + self.direction[1]
-
-        # Walls - Death
-        if nx < 0 or nx >= GRID_W or ny < 0 or ny >= GRID_H:
-            return False
-
-        new_head = (nx, ny)
-        if new_head in self.snake:
-            return False # Self-collision - Death
-
-        self.snake.insert(0, new_head)
-
-        if self.food and new_head == self.food:
-            self.score += 1
-            self.spawn_food()
-        else:
-            self.snake.pop()
-
-        return True
-
-    def render(self):
-        # 1. Clear Screen
-        self.ui.draw.rectangle((0, 0, self.screen_w, self.content_bottom), fill="black")
-
-        # 2. Header (Smaller Font, Monochrome)
-        self.ui.draw.text((5, 5), "Snake", font=self.ui.font_md, fill="white")
-        
-        score_text = f"{self.score}"
-        w, h = self.ui.get_text_size(score_text, self.ui.font_md)
-        self.ui.draw.text((self.screen_w - 5 - w, 5), score_text, font=self.ui.font_md, fill="white")
-
-        # 3. Board Outline
-        self.ui.draw.rectangle(
-            (self.board_x, self.board_top, self.board_x + self.board_w - 1, self.board_bottom - 1),
-            outline="white",
-        )
-
-        # 4. Food (Hollow Box style)
-        if self.food:
-            fx = self.board_x + (self.food[0] * self.cell)
-            fy = self.board_top + (self.food[1] * self.cell)
-            # Draw outline white, fill black
-            self.ui.draw.rectangle(
-                (fx + 1, fy + 1, fx + self.cell - 2, fy + self.cell - 2),
-                outline="white",
-                fill="black",
-            )
-
-        # 5. Snake (Solid White)
-        for idx, (x, y) in enumerate(self.snake):
-            px = self.board_x + (x * self.cell)
-            py = self.board_top + (y * self.cell)
-            self.ui.draw.rectangle((px + 1, py + 1, px + self.cell - 2, py + self.cell - 2), fill="white")
-
-        # 6. Softkey
-        self.softkey.update("Back") # Handles flush
-
-    def game_over(self):
-        # 1. Clear Entire Screen
-        self.ui.draw.rectangle((0, 0, self.screen_w, self.screen_h), fill="black")
-        
-        # 2. Big "Game Over"
-        text = "GAME OVER"
-        w, h = self.ui.get_text_size(text, self.ui.font_xl)
-        y_title = max(20, int(self.content_bottom * 0.28))
-        self.ui.draw.text(((self.screen_w - w) // 2, y_title), text, font=self.ui.font_xl, fill="white")
-        
-        # 3. Score
-        score_text = f"Score: {self.score}"
-        w2, h2 = self.ui.get_text_size(score_text, self.ui.font_md)
-        self.ui.draw.text(((self.screen_w - w2) // 2, y_title + 42), score_text, font=self.ui.font_md, fill="white")
-
-        # 4. Instructions
-        prompt = "Restart"
-        self.softkey.update(prompt) # Updates bottom bar
-        self.ui.fb.update(self.ui.canvas)
-
-        # 5. Wait for Input (Blocking is fine here)
-        while True:
-            # We poll slightly slower here to save CPU
-            key = self.poll_key(0.1)
-            
-            # Restart on: Menu, Enter, or '5' (common action key)
-            if key in (KEY_MENU, KEY_ENTER, 5): 
-                return "restart"
-            # Exit on: Backspace/Clear
-            if key in (KEY_BACK, 14):
-                return "exit"
-
-    def play(self):
-        while True:
-            result = self.loop()
-            if result == "exit": return
-            
-            decision = self.game_over()
-            if decision == "exit": return
-            
-            self.reset()
-
-    def loop(self):
-        # Similar loop to before
-        next_move = time.time() + self.tick_delay()
-        while True:
-            now = time.time()
-            timeout = max(0, next_move - now)
-            key = self.poll_key(timeout)
-            
-            if key is not None:
-                new_dir = self.direction_from_key(key)
-                if key == KEY_BACK: return "exit"
-                if new_dir:
-                    # Prevent 180 turn
-                    if (new_dir[0] + self.direction[0], new_dir[1] + self.direction[1]) != (0, 0):
-                        self.next_direction = new_dir
-            
-            if time.time() >= next_move:
-                if not self.step():
-                    return "dead"
-                self.render()
-                next_move = time.time() + self.tick_delay()
 
 def run(ui):
-    game = SnakeGame(ui)
-    game.play()
+    while True:
+        choice = _show_menu(ui, "Games", ["Memory", "Snake"])
+        if choice < 0:
+            return
+        if choice == 0:
+            memory_menu(ui)
+        elif choice == 1:
+            snake_menu(ui)

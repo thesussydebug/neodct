@@ -89,8 +89,8 @@ class I2CMatrixScanner:
         self._validate_pins()
         self.chip = PCF8575(bus=bus, addr=addr)
         self.chip.write16(0xFFFF)
-        self._held = None
-        self._empty_scans = 0
+        self._held = {}       # (row, col) -> consecutive scans missing
+        self._pending = []    # extra new presses queued for later scan_once calls
 
     def _validate_pins(self):
         seen = set()
@@ -103,8 +103,13 @@ class I2CMatrixScanner:
             seen.add(pin)
 
     def _raw_scan(self):
-        """One full pass. Returns first (row_idx, col_idx) found or None."""
-        found = None
+        """One full pass. Returns the set of every pressed (row_idx, col_idx).
+
+        Scanning the whole matrix (instead of stopping at the first hit)
+        gives key rollover: pressing a second key while one is still held
+        must be seen, or games miss direction changes.
+        """
+        found = set()
         for row_idx, row_pin in enumerate(self.row_pins):
             self.chip.write16(0xFFFF & ~(1 << row_pin))
             # The I2C transactions themselves take ~0.5 ms at 100 kHz;
@@ -113,29 +118,32 @@ class I2CMatrixScanner:
             value = self.chip.read16()
             for col_idx, col_pin in enumerate(self.col_pins):
                 if not (value >> col_pin) & 1:
-                    found = (row_idx, col_idx)
-                    break
-            if found is not None:
-                break
+                    found.add((row_idx, col_idx))
         self.chip.write16(0xFFFF)
         return found
 
     def scan_once(self):
-        detected = self._raw_scan()
+        current = self._raw_scan()
 
-        if detected is None:
-            if self._held is not None:
-                self._empty_scans += 1
-                if self._empty_scans >= RELEASE_SCANS:
-                    self._held = None
-                    self._empty_scans = 0
-            return None
+        # Edge-detect per key, with release debounce per key: a key only
+        # counts as released after RELEASE_SCANS consecutive scans without it.
+        new_presses = [pos for pos in current if pos not in self._held]
 
-        self._empty_scans = 0
-        if detected == self._held:
-            return None
-        self._held = detected
-        return detected
+        for pos in current:
+            self._held[pos] = 0
+        for pos in list(self._held):
+            if pos not in current:
+                self._held[pos] += 1
+                if self._held[pos] >= RELEASE_SCANS:
+                    del self._held[pos]
+
+        if new_presses:
+            new_presses.sort()
+            self._pending.extend(new_presses[1:])
+            return new_presses[0]
+        if self._pending:
+            return self._pending.pop(0)
+        return None
 
     def close(self):
         self.chip.close()

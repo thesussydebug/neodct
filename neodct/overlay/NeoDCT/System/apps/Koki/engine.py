@@ -17,7 +17,9 @@ import select
 import shutil
 import struct
 import subprocess
+import threading
 import time
+from array import array
 from collections import OrderedDict
 
 from PIL import Image, ImageChops
@@ -32,6 +34,7 @@ FRAME_DT = 1.0 / FPS
 
 # alpha > 40 counts as solid for collision (Scratch-like)
 ALPHA_THRESH_LUT = bytes(255 if v > 40 else 0 for v in range(256))
+IDENTITY_LUT = bytes(range(256))
 
 # evdev key codes -> logical game keys.
 KEYMAP = {
@@ -141,11 +144,150 @@ class Input:
 
 
 # --------------------------------------------------------------------------
-# Sound: music via a looping mpv child, sfx via short-lived mpv children.
-# Degrades to log-only when audio is unavailable (kernel audio is WIP).
+# Sound. Preferred: in-process miniaudio mixer -- one playback device, all
+# sounds decoded and mixed inside this process. No spawn latency (mpv took
+# hundreds of ms to init per sfx on an emulated CPU), a single ALSA client
+# (aplay+mpg123 fighting over QEMU's emulated card broke music), and
+# kilobytes of RAM instead of ~24MB private per mpv. Falls back to external
+# players when python-miniaudio isn't installed, and to log-only when audio
+# is unavailable entirely (kernel audio is WIP).
 # --------------------------------------------------------------------------
+class _MiniaudioMixer:
+    RATE = 22050          # everything in assets/snd is 22050 Hz mono s16
+    MAX_SFX = 3
+
+    class _Voice:
+        __slots__ = ("mixer", "path", "loop", "gen", "buf", "done")
+
+        def __init__(self, mixer, path, loop):
+            self.mixer = mixer
+            self.path = path
+            self.loop = loop
+            self.buf = b""
+            self.done = False
+            self.gen = mixer._stream(path)
+
+        def read(self, nbytes):
+            parts = [self.buf]
+            have = len(self.buf)
+            while have < nbytes and not self.done:
+                try:
+                    chunk = next(self.gen)
+                except StopIteration:
+                    if self.loop:
+                        self.gen = self.mixer._stream(self.path)
+                        continue
+                    self.done = True
+                    break
+                b = chunk.tobytes()
+                parts.append(b)
+                have += len(b)
+            data = b"".join(parts)
+            self.buf = data[nbytes:]
+            return data[:nbytes]
+
+    def __init__(self):
+        import miniaudio                  # ImportError -> caller falls back
+        try:
+            import audioop                # C-speed mixing (stdlib < 3.13)
+        except ImportError:
+            audioop = None
+        self._ma = miniaudio
+        self._audioop = audioop
+        self.lock = threading.Lock()
+        self.music = None                 # looping _Voice
+        self.voices = []                  # one-shot sfx _Voices
+        buf_ms = int(os.environ.get("NEODCT_KOKI_ABUF_MS", "150"))
+        self.device = miniaudio.PlaybackDevice(
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1, sample_rate=self.RATE, buffersize_msec=buf_ms)
+        gen = self._pump()
+        next(gen)
+        self.device.start(gen)
+
+    def _stream(self, path):
+        return self._ma.stream_file(
+            path, output_format=self._ma.SampleFormat.SIGNED16,
+            nchannels=1, sample_rate=self.RATE)
+
+    def _mix(self, a, b):
+        """Saturating s16 add of two equal-length byte strings."""
+        if self._audioop is not None:
+            return self._audioop.add(a, b, 2)
+        x = array("h")
+        x.frombytes(a)
+        y = array("h")
+        y.frombytes(b)
+        for i, v in enumerate(y):
+            s = x[i] + v
+            x[i] = 32767 if s > 32767 else (-32768 if s < -32768 else s)
+        return x.tobytes()
+
+    def _pump(self):
+        """Audio-thread generator: mix all live voices into each chunk.
+        Must never raise -- an exception here kills playback silently."""
+        required = yield b""
+        while True:
+            nbytes = required * 2                     # s16 mono
+            mixed = None
+            with self.lock:
+                live = list(self.voices)
+                if self.music is not None:
+                    live.append(self.music)
+                for v in live:
+                    try:
+                        data = v.read(nbytes)
+                    except Exception:
+                        v.done = True
+                        continue
+                    if not data:
+                        continue
+                    if len(data) < nbytes:
+                        data += bytes(nbytes - len(data))
+                    mixed = data if mixed is None else self._mix(mixed, data)
+                if any(v.done for v in self.voices):
+                    self.voices = [v for v in self.voices if not v.done]
+                if self.music is not None and self.music.done:
+                    self.music = None
+            out = array("h")
+            out.frombytes(mixed if mixed is not None else bytes(nbytes))
+            required = yield out
+
+    def play_music(self, path):
+        with self.lock:
+            self.music = self._Voice(self, path, True)
+
+    def play_sfx(self, path):
+        with self.lock:
+            self.voices = [v for v in self.voices if not v.done]
+            if len(self.voices) < self.MAX_SFX:
+                self.voices.append(self._Voice(self, path, False))
+
+    def stop_music(self):
+        with self.lock:
+            self.music = None
+
+    def stop_all(self):
+        with self.lock:
+            self.music = None
+            self.voices = []
+
+    def close(self):
+        try:
+            self.device.stop()
+            self.device.close()
+        except Exception:
+            pass
+
+
 class SoundManager:
     MAX_SFX = 3
+    # memory trims; probed against the installed mpv at init and dropped
+    # wholesale if its build rejects any of them (unknown option = instant
+    # exit = total silence)
+    MPV_EXTRA = ["--no-config", "--load-scripts=no", "--audio-display=no",
+                 "--cache=no", "--demuxer-max-bytes=1MiB",
+                 "--demuxer-max-back-bytes=256KiB"]
 
     def __init__(self, base_dir):
         self.base = base_dir
@@ -153,13 +295,86 @@ class SoundManager:
         self.sfx_procs = []
         self.enabled = True
         self.reasons_logged = set()
+        self.debug = bool(os.environ.get("NEODCT_KOKI_SOUND_DEBUG"))
+        self.backend = None
+        self.players = {}
+        self.avail = set()
+        self._mpv_extra = []
         if os.environ.get("NEODCT_KOKI_NOSOUND"):
             self._disable("NEODCT_KOKI_NOSOUND set")
-        elif shutil.which("mpv") is None:
-            self._disable("mpv not found in PATH")
-        elif not os.path.isdir("/dev/snd"):
+            return
+        if not os.path.isdir("/dev/snd"):
             self._disable("/dev/snd missing (no ALSA device; kernel audio "
                           "not implemented yet?)")
+            return
+
+        # preferred backend: in-process miniaudio mixer.
+        # NEODCT_KOKI_AUDIO=subprocess forces the external players instead;
+        # =miniaudio makes its absence a hard disable rather than a fallback.
+        forced = os.environ.get("NEODCT_KOKI_AUDIO", "")
+        if forced != "subprocess":
+            try:
+                self.backend = _MiniaudioMixer()
+                print("[Koki] audio: in-process miniaudio mixer")
+                return
+            except Exception as e:
+                msg = f"miniaudio unavailable ({e.__class__.__name__}: {e})"
+                if forced == "miniaudio":
+                    self._disable(msg)
+                    return
+                print(f"[Koki] {msg}; falling back to external players")
+
+        # fallback: external player processes
+        self.avail = {p for p in ("aplay", "mpg123", "mpv")
+                      if shutil.which(p)}
+
+        def pick(env, *prefs):
+            forced = os.environ.get(env)
+            if forced:
+                return forced
+            return next((p for p in prefs if p in self.avail), None)
+
+        # sfx: aplay -- starts in ms (mpv's init delay is audible on emulated
+        # CPUs) and its RSS is trivial. music: mpv -- its deep buffering
+        # survives sharing the device with aplay bursts, unlike mpg123
+        # (which stuttered/reset when aplay grabbed QEMU's emulated card).
+        self.players = {
+            "wav": pick("NEODCT_KOKI_WAV_PLAYER", "aplay", "mpv"),
+            "mp3": pick("NEODCT_KOKI_MP3_PLAYER", "mpv", "mpg123"),
+        }
+        # mpv's footprint is per-PROCESS (demuxer flags barely dent it since
+        # our tracks are <1MiB whole); if sfx have to fall back to mpv on a
+        # small-RAM system, cap them hard (2 concurrent OOM'd a 72MB VM)
+        if self.players["wav"] == "mpv":
+            try:
+                with open("/proc/meminfo") as f:
+                    if int(f.readline().split()[1]) < 72 * 1024:
+                        self.MAX_SFX = 1
+            except Exception:
+                pass
+        try:
+            self.MAX_SFX = int(os.environ["NEODCT_KOKI_MAX_SFX"])
+        except (KeyError, ValueError):
+            pass
+
+        if "mpv" in self.avail:
+            try:
+                ok = subprocess.run(
+                    ["mpv"] + self.MPV_EXTRA + ["--version"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10).returncode == 0
+            except Exception:
+                ok = False
+            if ok:
+                self._mpv_extra = self.MPV_EXTRA
+            else:
+                print("[Koki] this mpv rejects the memory-trim flags; "
+                      "running it plain")
+        if not any(self.players.values()):
+            self._disable("no audio player found (aplay/mpg123/mpv)")
+        else:
+            print(f"[Koki] audio players: sfx={self.players['wav']} "
+                  f"music={self.players['mp3']}")
 
     def _disable(self, reason):
         if reason not in self.reasons_logged:
@@ -167,26 +382,72 @@ class SoundManager:
             print(f"[Koki] SOUND DISABLED: {reason} -- game continues silent")
         self.enabled = False
 
+    def _log_once(self, msg):
+        if msg not in self.reasons_logged:
+            self.reasons_logged.add(msg)
+            print(f"[Koki] {msg}")
+
     def _spawn(self, path, loop=False):
-        cmd = ["mpv", "--no-video", "--really-quiet", "--no-terminal"]
-        if loop:
-            cmd.append("--loop=inf")
-        cmd.append(path)
+        ext = "mp3" if path.endswith(".mp3") else "wav"
+        player = self.players.get(ext)
+        if loop and player == "aplay":     # aplay has no loop mode
+            player = "mpv" if "mpv" in self.avail else None
+            self._log_once("looped wav needs mpv (aplay can't loop)"
+                           if player else
+                           "no looping wav player; music skipped")
+        if player is None:
+            self._log_once(f"no {ext} player installed; skipping {ext} audio")
+            return None
+        if player == "aplay":
+            cmd = ["aplay", "-q", path]
+        elif player == "mpg123":
+            cmd = ["mpg123", "-q"]
+            if loop:
+                cmd += ["--loop", "-1"]
+            cmd.append(path)
+        else:
+            cmd = ["mpv", "--no-video", "--really-quiet",
+                   "--no-terminal"] + self._mpv_extra
+            if loop:
+                cmd.append("--loop=inf")
+            cmd.append(path)
+        if self.debug:
+            print(f"[Koki] sound spawn: {' '.join(cmd)}")
         try:
+            # debug: let the player's own errors reach the console
+            err = None if self.debug else subprocess.DEVNULL
             return subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cmd, stdout=subprocess.DEVNULL, stderr=err)
         except Exception as e:
-            self._disable(f"mpv spawn failed: {e}")
+            self._disable(f"{player} spawn failed: {e}")
             return None
 
     def music(self, rel):
         """Play a track on repeat (replaces current music)."""
-        self.stop_music()
         if not self.enabled:
             return
+        if self.backend is not None:
+            self.backend.play_music(os.path.join(self.base, rel))
+            return
+        self.stop_music()
         self.music_proc = self._spawn(os.path.join(self.base, rel), loop=True)
 
+    def check(self):
+        """Called periodically: looping music should never exit on its own,
+        so an exit here means the player crashed or the OOM killer got it."""
+        if self.backend is not None:
+            return
+        p = self.music_proc
+        if p is not None and p.poll() is not None:
+            self.music_proc = None
+            self._log_once(f"music player died (rc={p.returncode}) -- bad "
+                           "option or OOM kill? check dmesg / run with "
+                           "NEODCT_KOKI_SOUND_DEBUG=1")
+
     def stop_music(self):
+        if self.backend is not None:
+            self.backend.stop_music()
+            return
         p = self.music_proc
         self.music_proc = None
         if p is not None:
@@ -199,6 +460,9 @@ class SoundManager:
     def sfx(self, rel):
         if not self.enabled:
             return
+        if self.backend is not None:
+            self.backend.play_sfx(os.path.join(self.base, rel))
+            return
         self.sfx_procs = [p for p in self.sfx_procs if p.poll() is None]
         if len(self.sfx_procs) >= self.MAX_SFX:
             return
@@ -207,6 +471,10 @@ class SoundManager:
             self.sfx_procs.append(p)
 
     def stop_all(self):
+        """Silence everything (grade screens use this mid-game)."""
+        if self.backend is not None:
+            self.backend.stop_all()
+            return
         self.stop_music()
         for p in self.sfx_procs:
             try:
@@ -216,7 +484,13 @@ class SoundManager:
                 pass
         self.sfx_procs = []
 
-    shutdown = stop_all
+    def shutdown(self):
+        """App exit: also release the audio device (backend mode)."""
+        self.stop_all()
+        b = self.backend
+        self.backend = None
+        if b is not None:
+            b.close()
 
 
 # --------------------------------------------------------------------------
@@ -518,16 +792,21 @@ class Engine:
         self.vars = {}                   # Scratch global variables
         self.random = random.Random()
 
-        # byte-budgeted caches: the RV1103 has ~32MB for all of userspace
-        # (ISP reserves the rest of the 64MB), so shrink on small systems
+        # byte-budgeted caches, tiered by system RAM: the Luckfox has ~53MB
+        # for userspace after the CMA/ISP fix (was 32MB), QEMU tests run with
+        # 64MB. A level's working set is well under 1MB now that oversized
+        # static art is cropped at bake time, so small budgets don't thrash.
         img_default, fx_default = "3072", "1024"
         try:
             with open("/proc/meminfo") as f:
                 total_kb = int(f.readline().split()[1])
-            if total_kb < 48 * 1024:
+            if total_kb < 40 * 1024:
+                img_default, fx_default = "1024", "384"
+            elif total_kb < 72 * 1024:
                 img_default, fx_default = "1536", "512"
+            if (img_default, fx_default) != ("3072", "1024"):
                 print(f"[Koki] small RAM ({total_kb // 1024}MB): "
-                      "using reduced cache budgets")
+                      f"cache budgets {img_default}/{fx_default}KB")
         except Exception:
             pass
         def _env_kb(name, default):
@@ -568,7 +847,8 @@ class Engine:
     def load_image(self, rel):
         img = self._img_cache.get(rel)
         if img is None:
-            img = Image.open(os.path.join(self.assets, rel)).convert("RGBA")
+            with Image.open(os.path.join(self.assets, rel)) as f:
+                img = f.convert("RGBA")
             self._img_cache.put(rel, img)
         return img
 
@@ -600,7 +880,10 @@ class Engine:
         stage = self.manifest["targets"]["Stage"]
         for c in stage["costumes"]:
             if c["name"].lower() == str(name).lower():
-                img = self.load_image(c["img"]).convert("RGB")
+                # decode directly: only the RGB screen crop is kept, so the
+                # RGBA original would just evict sprites from the img cache
+                with Image.open(os.path.join(self.assets, c["img"])) as f:
+                    img = f.convert("RGB")
                 # Backdrops render centered on the stage; crop to screen.
                 left = int(round(c["cx"] - CENTER_X))
                 top = int(round(c["cy"] - CENTER_Y))
@@ -683,6 +966,13 @@ class Engine:
         self.layers.clear()
         self.backdrop_img = None
         self.sound.shutdown()
+        try:
+            # glibc: hand freed heap pages back to the kernel so the rest
+            # of the OS isn't squeezed after the game exits (musl lacks it)
+            import ctypes
+            ctypes.CDLL(None).malloc_trim(0)
+        except Exception:
+            pass
 
     # -- script helpers (all generators) ---------------------------------------
     def wait(self, secs):
@@ -744,17 +1034,15 @@ class Engine:
                 Image.Resampling.NEAREST)
         if flip:
             out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        # one point() with a per-band LUT: no split/merge temporaries
         if bri_q:
             add = int(2.55 * bri_q)
             lut = bytes(max(0, min(255, v + add)) for v in range(256))
-            r, g, b, a = out.split()
-            out = Image.merge("RGBA", (r.point(lut), g.point(lut),
-                                       b.point(lut), a))
+            out = out.point(lut * 3 + IDENTITY_LUT)
         if ghost_q:
             factor = (100 - ghost_q) / 100.0
             lut = bytes(int(v * factor) for v in range(256))
-            r, g, b, a = out.split()
-            out = Image.merge("RGBA", (r, g, b, a.point(lut)))
+            out = out.point(IDENTITY_LUT * 3 + lut)
 
         self._fx_cache.put(key, out)
         return out, cx, cy
@@ -848,6 +1136,8 @@ class Engine:
                 busy = _now() - t0
                 busy_acc += busy
                 frames += 1
+                if frames % 30 == 0:
+                    self.sound.check()
                 if self.perf and _now() - t_report >= 5.0:
                     print(f"[Koki] avg frame {busy_acc / frames * 1000:.1f}ms "
                           f"({frames / (_now() - t_report):.1f} fps)")

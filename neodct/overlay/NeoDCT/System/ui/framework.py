@@ -951,3 +951,156 @@ class PagedList:
 
             elif key == 14:  # BACKSPACE
                 return -1
+
+"""
+
+TextScroller is the Nokia-style instructions/help reader: a full screen of
+wrapped text paged with the softkey. The softkey reads "More" until the last
+page, where it becomes "Back" (see the 5190 game instructions screens).
+
+"""
+class TextScroller:
+    def __init__(self, ui, text, more_text="More", back_text="Back"):
+        self.ui = ui
+        self.text = text or ""
+        self.more_text = more_text
+        self.back_text = back_text
+        self.page = 0
+
+        self.font = getattr(ui, "font_n", None) or ui.font_md
+        self.margin = 10
+        self.top = 8
+
+    def _wrap_text(self, text, max_w):
+        def text_w(s):
+            return self.ui.get_text_size(s, self.font)[0]
+
+        lines = []
+        for raw in (text or "").splitlines() or [""]:
+            words = raw.split(" ")
+            cur = ""
+            for w in words:
+                if w == "":
+                    continue
+                cand = w if not cur else (cur + " " + w)
+                if text_w(cand) <= max_w:
+                    cur = cand
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            lines.append(cur)
+        while lines and lines[-1] == "":
+            lines.pop()
+        return lines or [""]
+
+    def _paginate(self):
+        screen_w = _ui_width(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        lines = self._wrap_text(self.text, screen_w - (self.margin * 2))
+        line_h = self.ui.get_text_size("Ag", self.font)[1] + 4
+        per_page = max(1, (content_bottom - self.top - 4) // line_h)
+        pages = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
+        return pages or [[""]], line_h
+
+    def draw(self):
+        screen_w = _ui_width(self.ui)
+        content_bottom = _content_bottom(self.ui)
+        pages, line_h = self._paginate()
+        self.page = max(0, min(self.page, len(pages) - 1))
+
+        self.ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+        y = self.top
+        for line in pages[self.page]:
+            self.ui.draw.text((self.margin, y), line, font=self.font, fill="white")
+            y += line_h
+
+        last_page = self.page >= len(pages) - 1
+        SoftKeyBar(self.ui).update(self.back_text if last_page else self.more_text)
+        return last_page
+
+    def show(self):
+        """Blocking loop. ENTER/DOWN pages forward (exits past the last page),
+        UP pages back, BACKSPACE exits immediately."""
+        last_page = self.draw()
+
+        while True:
+            key = self.ui.wait_for_key()
+
+            if key in (28, 108):  # ENTER (softkey) / DOWN
+                if last_page:
+                    return
+                self.page += 1
+                last_page = self.draw()
+
+            elif key == 103:  # UP
+                if self.page > 0:
+                    self.page -= 1
+                    last_page = self.draw()
+
+            elif key == 14:  # BACKSPACE
+                return
+
+"""
+
+LevelSelector is the Nokia game difficulty picker: a "Level" list with an OK
+softkey. Digit keys jump straight to that level, like on the 5190.
+
+"""
+class LevelSelector(VerticalList):
+    def __init__(self, ui, current=1, count=9, title="Level", app_id=6):
+        items = [f"Level {n}" for n in range(1, count + 1)]
+        super().__init__(ui, title, items, app_id=app_id)
+        self.selected_index = max(0, min(count - 1, int(current) - 1))
+
+    def show(self):
+        """Blocking loop. Returns the chosen level (1-based) or None on back."""
+        SoftKeyBar(self.ui).update("OK", present=False)
+        choice = super().show()
+        if choice < 0:
+            return None
+        return choice + 1
+
+"""
+
+InfoScreen is a simple centered label/value readout (e.g. "Top score" / "385",
+or the Call Log duration screens) dismissed with the softkey. Unlike
+MessageDialog it has no icon and is not a warning; it is a plain reading.
+
+"""
+class InfoScreen:
+    def __init__(self, ui, title, value=None, softkey_text="Back"):
+        self.ui = ui
+        self.title = title or ""
+        self.value = value
+        self.softkey_text = softkey_text
+
+    def show(self):
+        ui = self.ui
+        screen_w = _ui_width(ui)
+        content_bottom = _content_bottom(ui)
+
+        ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+
+        title_font = ui.font_n
+        value_font = ui.font_xl
+
+        tw, th = ui.get_text_size(self.title, title_font)
+        if self.value is None:
+            ty = max(0, (content_bottom - th) // 2)
+            ui.draw.text(((screen_w - tw) // 2, ty), self.title, font=title_font, fill="white")
+        else:
+            value_text = str(self.value)
+            vw, vh = ui.get_text_size(value_text, value_font)
+            gap = 10
+            total = th + gap + vh
+            ty = max(0, (content_bottom - total) // 2)
+            ui.draw.text(((screen_w - tw) // 2, ty), self.title, font=title_font, fill="white")
+            ui.draw.text(((screen_w - vw) // 2, ty + th + gap), value_text, font=value_font, fill="white")
+
+        SoftKeyBar(ui).update(self.softkey_text)
+
+        while True:
+            key = ui.wait_for_key()
+            if key in (28, 14):
+                return key
