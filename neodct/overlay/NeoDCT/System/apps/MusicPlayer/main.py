@@ -162,6 +162,7 @@ class MusicPlayer:
         
         if meta["art"]:
             try:
+                meta["art"].draft("RGB", (art_size * 2, art_size * 2))
                 meta["art"].load()
                 display_art = meta["art"].resize((art_size, art_size), Image.Resampling.NEAREST)
             except Exception:

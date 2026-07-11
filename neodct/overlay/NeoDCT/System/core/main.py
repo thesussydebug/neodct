@@ -12,6 +12,7 @@ import json
 import fcntl
 import traceback
 import glob
+import gc
 # --- THE FIX: Import ImageFile to handle "broken" JPEGs ---
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFile 
 from System.ui.framework import AppSelector, SoftKeyBar
@@ -309,8 +310,7 @@ class Framebuffer:
         self.mm.seek(0)
         self.mm.write(b"\x00" * self.size)
 
-        # Reuse target buffer/image to avoid per-frame allocations.
-        self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
+        self.native_img = None
         self._black = (0, 0, 0)
 
         # RGB565 fallback lookup tables + buffers are only needed on the
@@ -424,6 +424,8 @@ class Framebuffer:
                 return
 
         # Clear reusable target, then paste current frame.
+        if self.native_img is None:
+            self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
         self.native_img.paste(self._black, (0, 0, self.stride_pixels, self.yres))
         self.native_img.paste(cropped, (dst_x, dst_y))
 
@@ -894,6 +896,8 @@ class NeoDCT_UI:
             print(f"[OS] App crashed: {app_name} ({path})")
             traceback.print_exc()
             show_app_crash(self, app_name=app_name, exc_info=sys.exc_info())
+        finally:
+            gc.collect()
 
     def render_menu(self):
         try:

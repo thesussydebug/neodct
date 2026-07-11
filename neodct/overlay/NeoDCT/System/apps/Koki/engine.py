@@ -113,18 +113,12 @@ class Input:
                 code = m.read_key(0)
             except Exception:
                 code = None
-                # I2C error: the backend's _held is stale, so our latched
-                # key would stay logically held forever (phantom drift).
-                # Drop the latch; a healthy scan re-establishes it.
                 if self._matrix_code is not None:
                     self.held.discard(self._matrix_code)
                     self._matrix_code = None
             if code is not None:
                 name = KEYMAP.get(code)
                 if name:
-                    # the scanner reports ONE key at a time: a new press
-                    # replaces the previous one, else it stays latched
-                    # (walk right + press X used to drift right forever)
                     if self._matrix_code and self._matrix_code != name:
                         self.held.discard(self._matrix_code)
                     self.pressed.add(name)
@@ -132,7 +126,7 @@ class Input:
                     self._matrix_code = name
             if self._matrix_code is not None:
                 holder = getattr(m, "scanner", m)
-                if getattr(holder, "_held", None) is None:
+                if not getattr(holder, "_held", None):
                     self.held.discard(self._matrix_code)
                     self._matrix_code = None
 
