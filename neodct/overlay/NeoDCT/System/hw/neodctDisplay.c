@@ -1,5 +1,5 @@
 /*
- * neodctDisplay.c v2.1 — userspace ST7789 display daemon for NeoDCT
+ * neodctDisplay.c v2.2 — userspace ST7789 display daemon for NeoDCT
  * Luckfox Pico Mini B (RV1103), 240x240 Waveshare ST7789 over SPI0
  *
  * v2 changes (single-core RV1103 optimization):
@@ -54,6 +54,13 @@
 #define OFFSET_X   0
 #define OFFSET_Y   0           /* if image is shifted, try 80 (240x240 quirk) */
 
+/* The fb is forced to the NeoDCT UI band size; the daemon places the
+ * band on the physical panel at --yoff (default: bottom-aligned, top
+ * rows stay black -- matching the Nokia faceplate window). */
+#define FB_W       240
+#define FB_H       175
+#define DEFAULT_Y_OFFSET (PANEL_H - FB_H)   /* 65 */
+
 #define SPI_DEVICE "/dev/spidev0.0"
 #define SPI_BITS   8
 #define SPI_MODE   0           /* proven on this board+panel by fb_diag */
@@ -71,6 +78,7 @@ static int opt_fps     = DEFAULT_FPS;
 static int opt_full    = 0;   /* disable diffing */
 static int opt_swap_rb = 0;
 static int opt_stats   = 0;
+static int opt_yoff    = DEFAULT_Y_OFFSET;  /* panel row where fb band starts */
 
 /* ---------- globals ---------- */
 
@@ -317,14 +325,14 @@ static void force_mode(void)
      * daemon does the 565 packing during its existing copy loop.
      * Fall back to 16bpp if the fb driver refuses 32. */
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) return;
-    vinfo.xres = PANEL_W;  vinfo.yres = PANEL_H;
-    vinfo.xres_virtual = PANEL_W;  vinfo.yres_virtual = PANEL_H;
+    vinfo.xres = FB_W;  vinfo.yres = FB_H;
+    vinfo.xres_virtual = FB_W;  vinfo.yres_virtual = FB_H;
     vinfo.bits_per_pixel = 32;
     if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0 ||
         (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0 &&
          vinfo.bits_per_pixel != 32)) {
-        vinfo.xres = PANEL_W;  vinfo.yres = PANEL_H;
-        vinfo.xres_virtual = PANEL_W;  vinfo.yres_virtual = PANEL_H;
+        vinfo.xres = FB_W;  vinfo.yres = FB_H;
+        vinfo.xres_virtual = FB_W;  vinfo.yres_virtual = FB_H;
         vinfo.bits_per_pixel = 16;
         if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0)
             fprintf(stderr, "force_mode: FBIOPUT failed: %s\n", strerror(errno));
@@ -414,8 +422,9 @@ static size_t convert_rect(unsigned int x0, unsigned int y0,
  * Returns 1 if something was sent, 0 if skipped. */
 static int render_dirty(void)
 {
+    unsigned int max_h = PANEL_H - (unsigned int)opt_yoff;
     unsigned int copy_w = vinfo.xres < PANEL_W ? vinfo.xres : PANEL_W;
-    unsigned int copy_h = vinfo.yres < PANEL_H ? vinfo.yres : PANEL_H;
+    unsigned int copy_h = vinfo.yres < max_h ? vinfo.yres : max_h;
     size_t row_bytes = (size_t)copy_w * fb_bytespp;
 
     /* pass 1: dirty row range */
@@ -456,8 +465,8 @@ static int render_dirty(void)
     size_t n = convert_rect(xmin, ymin, xmax, ymax);
     double t1 = now_ms();
 
-    set_window((unsigned short)xmin, (unsigned short)ymin,
-               (unsigned short)xmax, (unsigned short)ymax);
+    set_window((unsigned short)xmin, (unsigned short)(ymin + opt_yoff),
+               (unsigned short)xmax, (unsigned short)(ymax + opt_yoff));
     write_data(out_buf, n);
     double t2 = now_ms();
 
@@ -471,14 +480,17 @@ static int render_dirty(void)
 /* v1 behavior: full frame, unconditional (also used for --once/--full). */
 static void render_full(void)
 {
+    unsigned int max_h = PANEL_H - (unsigned int)opt_yoff;
     unsigned int copy_w = vinfo.xres < PANEL_W ? vinfo.xres : PANEL_W;
-    unsigned int copy_h = vinfo.yres < PANEL_H ? vinfo.yres : PANEL_H;
+    unsigned int copy_h = vinfo.yres < max_h ? vinfo.yres : max_h;
 
     double t0 = now_ms();
     size_t n = convert_rect(0, 0, copy_w - 1, copy_h - 1);
     double t1 = now_ms();
 
-    set_window(0, 0, (unsigned short)(copy_w - 1), (unsigned short)(copy_h - 1));
+    set_window(0, (unsigned short)opt_yoff,
+               (unsigned short)(copy_w - 1),
+               (unsigned short)(opt_yoff + copy_h - 1));
     write_data(out_buf, n);
     double t2 = now_ms();
 
@@ -540,6 +552,11 @@ int main(int argc, char *argv[])
             if (opt_speed > 0 && opt_speed < 1000)
                 opt_speed *= 1000000;        /* "--speed 40" means 40 MHz */
         }
+        else if (!strcmp(argv[i], "--yoff") && i + 1 < argc) {
+            opt_yoff = parse_int(argv[++i], DEFAULT_Y_OFFSET);
+            if (opt_yoff < 0) opt_yoff = 0;
+            if (opt_yoff > PANEL_H - 1) opt_yoff = PANEL_H - 1;
+        }
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) {
             opt_fps = parse_int(argv[++i], DEFAULT_FPS);
             if (opt_fps < 1) opt_fps = 1;
@@ -553,8 +570,9 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("neodct_displayd v2.1 (panel %dx%d, %d Hz SPI, %d fps poll, %s)\n",
-           PANEL_W, PANEL_H, opt_speed, opt_fps,
+    printf("neodct_displayd v2.2 (panel %dx%d, fb band %dx%d at y=%d, "
+           "%d Hz SPI, %d fps poll, %s)\n",
+           PANEL_W, PANEL_H, FB_W, FB_H, opt_yoff, opt_speed, opt_fps,
            opt_full ? "full-frame" : "dirty-rect");
 
     out_buf_size = (size_t)PANEL_W * PANEL_H * 2;
