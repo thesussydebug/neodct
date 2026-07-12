@@ -62,9 +62,15 @@ class Input:
         self.held = set()          # logical names currently held
         self.pressed = set()       # logical names newly pressed this frame
         self._matrix_code = None
+        self._matrix_held = set()  # names contributed by the matrix keypad
         if self.matrix is not None:
-            print("[Koki] matrix keypad detected: single-key input only "
-                  "(no simultaneous move+jump).")
+            holder = getattr(self.matrix, "scanner", self.matrix)
+            if isinstance(getattr(holder, "_held", None), dict):
+                print("[Koki] matrix keypad: rollover scanner "
+                      "(simultaneous keys supported)")
+            else:
+                print("[Koki] matrix keypad detected: single-key input only "
+                      "(no simultaneous move+jump).")
 
     def poll(self):
         self.pressed.clear()
@@ -100,29 +106,45 @@ class Input:
                     self.held.discard(name)
                 # val == 2 (autorepeat): already held, ignore
 
-        # Matrix keypads report presses via read_key(); held state lives on
-        # the backend: gpiozero MatrixKeypadInput keeps `_held` on itself,
-        # pcf8575 I2CMatrixKeypadInput keeps it on its nested `scanner`.
+        # Matrix keypads report press EDGES via read_key(); held state lives
+        # on the backend: gpiozero MatrixKeypadInput keeps `_held` on itself
+        # (single value, None when released), the pcf8575 rollover scanner
+        # keeps a dict of every concurrently held (row,col) on `scanner`.
         m = self.matrix
         if m is not None:
             try:
-                code = m.read_key(0)
+                code = m.read_key(0)     # one scan pass; updates _held state
             except Exception:
                 code = None
-            if code is not None:
-                name = KEYMAP.get(code)
-                if name:
-                    # the scanner reports ONE key at a time: a new press
-                    # replaces the previous one, else it stays latched
-                    # (walk right + press X used to drift right forever)
-                    if self._matrix_code and self._matrix_code != name:
-                        self.held.discard(self._matrix_code)
-                    self.pressed.add(name)
-                    self.held.add(name)
-                    self._matrix_code = name
-            if self._matrix_code is not None:
-                holder = getattr(m, "scanner", m)
-                if getattr(holder, "_held", None) is None:
+            holder = getattr(m, "scanner", m)
+            state = getattr(holder, "_held", None)
+            to_code = getattr(m, "matrix_to_code", None)
+            if isinstance(state, dict) and to_code is not None:
+                # rollover scanner: derive the true multi-key held set from
+                # the scanner's own debounced state (an empty dict means
+                # nothing held -- it is never None, which the old single-key
+                # check relied on and latched keys forever)
+                cur = set()
+                for pos in state:
+                    name = KEYMAP.get(to_code.get(pos))
+                    if name:
+                        cur.add(name)
+                self.pressed |= cur - self._matrix_held
+                self.held -= self._matrix_held - cur
+                self.held |= cur
+                self._matrix_held = cur
+            else:
+                # single-key backends: a new press replaces the previous one
+                # (walk right + press X used to drift right forever)
+                if code is not None:
+                    name = KEYMAP.get(code)
+                    if name:
+                        if self._matrix_code and self._matrix_code != name:
+                            self.held.discard(self._matrix_code)
+                        self.pressed.add(name)
+                        self.held.add(name)
+                        self._matrix_code = name
+                if self._matrix_code is not None and state is None:
                     self.held.discard(self._matrix_code)
                     self._matrix_code = None
 
