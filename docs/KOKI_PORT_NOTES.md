@@ -276,3 +276,17 @@ SoundManager auto-selects: miniaudio if importable -> external players
 NEODCT_KOKI_ABUF_MS tunes device buffer (default 150). The subprocess
 chain and all its env knobs remain as the fallback. python-miniaudio is
 pip-installed on the user's QEMU VM (not yet a buildroot package).
+
+### Matrix input fix + rollover upgrade (2026-07-11)
+
+The rewritten pcf8575 scanner changed `scanner._held` from a single value
+(None = released) to a DICT of every held (row,col) -- the engine's old
+release check (`_held is None`) could never fire, so the first keypress
+latched forever on hardware. The engine now detects the dict form and
+derives the true held set from it each frame via `matrix_to_code`,
+which also unlocks the scanner's rollover: REAL multi-key input on
+hardware (hold 6 + press 5 = running jump, hold 0 to block while moving),
+matching QEMU keyboard behavior. Single-value backends (gpiozero) keep
+the old replace-on-new-press logic. Verified against the actual driver
+with a faked PCF8575 chip: press/hold/debounced-release, two-key chords
+with independent release, old-backend fallback.

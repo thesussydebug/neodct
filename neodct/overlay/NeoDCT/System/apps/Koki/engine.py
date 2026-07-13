@@ -62,9 +62,15 @@ class Input:
         self.held = set()          # logical names currently held
         self.pressed = set()       # logical names newly pressed this frame
         self._matrix_code = None
+        self._matrix_held = set()  # names contributed by the matrix keypad
         if self.matrix is not None:
-            print("[Koki] matrix keypad detected: single-key input only "
-                  "(no simultaneous move+jump).")
+            holder = getattr(self.matrix, "scanner", self.matrix)
+            if isinstance(getattr(holder, "_held", None), dict):
+                print("[Koki] matrix keypad: rollover scanner "
+                      "(simultaneous keys supported)")
+            else:
+                print("[Koki] matrix keypad detected: single-key input only "
+                      "(no simultaneous move+jump).")
 
     def poll(self):
         self.pressed.clear()
@@ -80,10 +86,6 @@ class Input:
                 try:
                     data = os.read(fd, 24)
                 except Exception:
-                    break
-                if not data:
-                    # EOF: select() reports the fd readable forever, so
-                    # 'continue' would busy-loop the whole single-core OS.
                     break
                 if len(data) == 24:
                     _, _, etype, code, val = struct.unpack("llHHI", data)
@@ -104,29 +106,45 @@ class Input:
                     self.held.discard(name)
                 # val == 2 (autorepeat): already held, ignore
 
-        # Matrix keypads report presses via read_key(); held state lives on
-        # the backend: gpiozero MatrixKeypadInput keeps `_held` on itself,
-        # pcf8575 I2CMatrixKeypadInput keeps it on its nested `scanner`.
+        # Matrix keypads report press EDGES via read_key(); held state lives
+        # on the backend: gpiozero MatrixKeypadInput keeps `_held` on itself
+        # (single value, None when released), the pcf8575 rollover scanner
+        # keeps a dict of every concurrently held (row,col) on `scanner`.
         m = self.matrix
         if m is not None:
             try:
-                code = m.read_key(0)
+                code = m.read_key(0)     # one scan pass; updates _held state
             except Exception:
                 code = None
-                if self._matrix_code is not None:
-                    self.held.discard(self._matrix_code)
-                    self._matrix_code = None
-            if code is not None:
-                name = KEYMAP.get(code)
-                if name:
-                    if self._matrix_code and self._matrix_code != name:
-                        self.held.discard(self._matrix_code)
-                    self.pressed.add(name)
-                    self.held.add(name)
-                    self._matrix_code = name
-            if self._matrix_code is not None:
-                holder = getattr(m, "scanner", m)
-                if not getattr(holder, "_held", None):
+            holder = getattr(m, "scanner", m)
+            state = getattr(holder, "_held", None)
+            to_code = getattr(m, "matrix_to_code", None)
+            if isinstance(state, dict) and to_code is not None:
+                # rollover scanner: derive the true multi-key held set from
+                # the scanner's own debounced state (an empty dict means
+                # nothing held -- it is never None, which the old single-key
+                # check relied on and latched keys forever)
+                cur = set()
+                for pos in state:
+                    name = KEYMAP.get(to_code.get(pos))
+                    if name:
+                        cur.add(name)
+                self.pressed |= cur - self._matrix_held
+                self.held -= self._matrix_held - cur
+                self.held |= cur
+                self._matrix_held = cur
+            else:
+                # single-key backends: a new press replaces the previous one
+                # (walk right + press X used to drift right forever)
+                if code is not None:
+                    name = KEYMAP.get(code)
+                    if name:
+                        if self._matrix_code and self._matrix_code != name:
+                            self.held.discard(self._matrix_code)
+                        self.pressed.add(name)
+                        self.held.add(name)
+                        self._matrix_code = name
+                if self._matrix_code is not None and state is None:
                     self.held.discard(self._matrix_code)
                     self._matrix_code = None
 
@@ -803,17 +821,8 @@ class Engine:
                       f"cache budgets {img_default}/{fx_default}KB")
         except Exception:
             pass
-        def _env_kb(name, default):
-            raw = os.environ.get(name, "")
-            try:
-                value = int(raw) if raw else int(default)
-            except ValueError:
-                print(f"[Koki] ignoring invalid {name}={raw!r}; using {default} KB")
-                return int(default)
-            return value if value > 0 else int(default)
-
-        img_kb = _env_kb("NEODCT_KOKI_IMG_CACHE_KB", img_default)
-        fx_kb = _env_kb("NEODCT_KOKI_FX_CACHE_KB", fx_default)
+        img_kb = int(os.environ.get("NEODCT_KOKI_IMG_CACHE_KB", img_default))
+        fx_kb = int(os.environ.get("NEODCT_KOKI_FX_CACHE_KB", fx_default))
         self._img_cache = LRUImages(img_kb * 1024)   # path -> RGBA
         self._fx_cache = LRUImages(fx_kb * 1024)     # (path,size,flip,fx) -> img
         self._mask_cache = LRUImages(256 * 1024)     # (path,flip) -> alpha L
@@ -1068,16 +1077,10 @@ class Engine:
         d.text((45, 62), "Quit Koki?", font=ui.font_n, fill="white")
         d.text((45, 90), "Enter=Yes  C=No", font=ui.font_s, fill="white")
         ui.fb.update(self.canvas)
-        # swallow the held back key first (bounded: if the input device dies
-        # while the key is held, its release never arrives and this loop
-        # would otherwise spin forever)
-        deadline = time.monotonic() + 1.0
+        # swallow the held back key first
         while self.input.key("back"):
             self.input.poll()
             time.sleep(0.02)
-            if time.monotonic() >= deadline:
-                self.input.held.discard("back")
-                break
         while True:
             self.input.poll()
             if "enter" in self.input.pressed:
@@ -1090,13 +1093,11 @@ class Engine:
     def run(self):
         if self.headless_frames is not None:
             self._vtime = 0.0  # virtual clock must exist before any script runs
+        self.start_flag()
         frames = 0
         busy_acc = 0.0
         t_report = _now()
         try:
-            # inside the try: flag handlers can start music, and an exception
-            # here must still reach teardown() or the mpv child leaks.
-            self.start_flag()
             while not self.quit:
                 t0 = _now()
                 self.input.poll()
