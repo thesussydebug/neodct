@@ -712,14 +712,22 @@ class MessageDialog:
             ui.draw.text((title_x, self.margin), self.title, font=self.font_title, fill="white")
             _, th = ui.get_text_size(self.title, self.font_title)
             y = max(y, self.margin + th + 6)
-        elif icon:
-            y = self.margin + icon.height + 6
+        if icon:
+            # The body must clear the icon even when the title is shorter
+            # than it, or the first line lands on the triangle.
+            y = max(y, self.margin + icon.height + 6)
 
-        # Body
+        # Body. Short notices ("LOW BATTERY!") get the Nokia alert look:
+        # normal font, centered. Paragraphs keep the small left-aligned form.
         max_w = screen_w - (self.margin * 2)
-        lines = self._wrap_text(self.message, self.font_body, max_w)
+        alert_font = getattr(self.ui, "font_n", None) or self.font_body
+        alert_lines = self._wrap_text(self.message, alert_font, max_w)
+        if len(alert_lines) <= 2:
+            font_body, lines, centered = alert_font, alert_lines, True
+        else:
+            font_body, lines, centered = self.font_body, self._wrap_text(self.message, self.font_body, max_w), False
 
-        line_h = ui.get_text_size("Ag", self.font_body)[1] + 3
+        line_h = ui.get_text_size("Ag", font_body)[1] + 3
         max_lines = max(1, int((content_bottom - y - self.margin) / line_h))
 
         if len(lines) > max_lines:
@@ -727,8 +735,16 @@ class MessageDialog:
             if lines:
                 lines[-1] = (lines[-1] + " …") if not lines[-1].endswith("…") else lines[-1]
 
+        # Vertically center the body in the space above the softkey.
+        y += max(0, (content_bottom - self.margin - y - len(lines) * line_h) // 2)
+
         for line in lines:
-            ui.draw.text((self.margin, y), line, font=self.font_body, fill="white")
+            if centered:
+                lw, _ = ui.get_text_size(line, font_body)
+                x = max(self.margin, (screen_w - lw) // 2)
+            else:
+                x = self.margin
+            ui.draw.text((x, y), line, font=font_body, fill="white")
             y += line_h
 
         # Softkey (draw but don't present yet)
@@ -736,6 +752,11 @@ class MessageDialog:
 
         # Present once
         ui.fb.update(ui.canvas)
+
+    def render(self):
+        """Draw the dialog without waiting for a key (e.g. shutdown notices)."""
+        self._flush_input()
+        self._draw()
 
     def show(self):
         """Blocking modal. Returns the key that dismissed it."""

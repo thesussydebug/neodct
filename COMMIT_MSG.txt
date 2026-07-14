@@ -1,0 +1,18 @@
+fun icons for the engineering apps, no more hard hats
+
+Replaced the placeholder icons with real 120x120 transparent PNGs
+(sources from "neodct icons/", baked-in transparency checkerboards
+removed):
+
+- CubeBench: white 3D cube cut off its checker background (local
+  flatness + convex hull, since the cube faces match the checker colors)
+- KeypadMapper: access-keypad photo, checker background removed
+- KeypadMapperI2C: same keypad with a blue I2C corner badge (both
+  source jpgs were byte-identical)
+- Crash: red-ball/white-X redrawn crisp at 4x and downscaled (source
+  png was a tiny icon nearest-neighbor upscaled, hopelessly pixelated)
+- LCDTest: monitor icon trimmed, padded square and rescaled
+- Tests: new clipboard icon, two green checks and one red X
+
+FuelGauge (diesel can) and LinuxShell (Tux) keep their icons.
+Also noted in the 0.2.4a CHANGELOG Engineering section.

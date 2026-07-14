@@ -1,0 +1,6 @@
+{
+    "name": "FuelGauge",
+    "id": "9004",
+    "icon": "icon.png",
+    "exec": "main.py"
+}

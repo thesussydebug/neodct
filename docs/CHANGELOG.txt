@@ -1,5 +1,53 @@
 NeoDCT Changelog
 
+Version 0.2.4a - 2026-07-13
+
+Power/Battery
+- New BatteryService (System/core/BatteryService): reads VCELL from a
+  MAX1704x fuel gauge over I2C (bus/addr configurable via
+  system.hw.battery_i2c_bus / system.hw.battery_i2c_addr, default 1/0x36).
+- Home screen battery gauge is now live: <3.35 V dead (bat-0), 0.20 V bands
+  up to >=3.95 V full (bat-4). Readings are smoothed over a 5-sample window.
+- LOW BATTERY! warning at <=3.45 V, BATTERY CRITICALLY LOW! at <=3.25 V
+  (one-shot, re-armed if the pack recovers), graceful poweroff at <=3.20 V
+  (confirmed over 3 consecutive polls; syncs filesystems first).
+- QEMU/dev fallback: without gauge hardware the service runs in Simulation
+  Mode (boot log says which mode is active, like the modem stub). Simulated
+  voltage overridable via NEODCT_BATT_SIM_VCELL env var or by writing a
+  value to /tmp/neodct_sim_vcell at runtime.
+- Added engineering/tools/max1704x_watch.py bench utility used for the
+  Raspberry Pi supply-sweep prototyping.
+
+Engineering
+- New FuelGauge engineering app (id 9004, diesel-can icon): live MAX1704x
+  readout (VCELL/SOC/CRATE/VERSION/CONFIG + system gauge state) refreshed
+  every second through the shared BatteryService handle. Softkey issues a
+  gauge quick-start (re-seeds SOC from VCELL for bench sweeps). Shows a
+  notice and exits when the gauge is simulated (QEMU / missing hardware),
+  like the other hardware-bound engineering apps.
+- BatteryService grew debug_snapshot() and quickstart() to back the app.
+- Engineering apps finally lost the hard-hat placeholder icon: CubeBench
+  (3D cube), KeypadMapper (access-keypad photo), KeypadMapperI2C (same
+  photo + I2C badge), Crash (red X ball, redrawn crisp), LCDTest
+  (monitor) and Tests (checklist clipboard). All 120x120 transparent
+  PNGs; FuelGauge and LinuxShell keep their existing icons.
+
+Framework
+- MessageDialog.render() draws a dialog without blocking on a key;
+  ErrorScreen.show_error(wait_for_ack=False) exposes it for the shutdown
+  notice.
+- MessageDialog layout fixes: body text no longer overlaps the warning
+  icon (affected every dialog incl. the alpha notice), the body block is
+  vertically centered, and short notices (<=2 lines) now render
+  Nokia-alert style: normal font, centered. Paragraphs keep the small
+  left-aligned layout.
+- Home layout icon_set elements now honor sim_val instead of a hardcoded
+  level (cell signal still simulated until the modem goes real).
+
+Versioning
+- Version bumped to 0.2.4a; stale version strings in an existing
+  settings.prop are now refreshed to the installed build.
+
 Version 0.2.0a - 2026-02-25
 
 Summary
