@@ -1,5 +1,35 @@
 NeoDCT Changelog
 
+Version 0.3.0a (in progress) - 2026-07-14
+
+Modem (SIM7600G bring-up -- MODEM SUPPORT!)
+- QEMU kernel config now ships the drivers the SIM7600 needs and they are
+  persisted in board/qemu/aarch64-virt/linux.config (they used to live only
+  in the ephemeral build .config): USB_SERIAL_OPTION (the driver that
+  actually creates /dev/ttyUSB0-4 for 1e0e:9001 -- its absence was why
+  lsusb saw the modem but no tty nodes appeared), plus QMI_WWAN for a
+  wwan0 interface at the stock PID, ACM/usbnet/RNDIS carried over.
+- New atcmd helper (engineering/tools/atcmd): one scriptable AT command
+  per call over BusyBox sh, with an advisory lock shared with the boot
+  script and the UI so replies never interleave.
+- New /etc/init.d/S45modem: backgrounded boot bring-up -- SIM check, PDP
+  context (IPV6 / fast.t-mobile.com by default, /etc/default/modem to
+  override), LTE registration wait, AT$QCRMCALL data call, wwan0 + SLAAC
+  + DNS64. Logs to /tmp/modem-boot.log, status in /tmp/modem.status.
+- ModemService is REAL now: owns the AT port via raw termios (no pyserial,
+  no ModemManager, no threads), auto-probes ports by USB interface number,
+  polls AT+CSQ/+CEREG/+COPS on staggered timers from the main loop, parses
+  call URCs (RING/+CLIP/VOICE CALL/NO CARRIER) into a state machine plus
+  event queue, and dial()/hangup() send real ATD/AT+CHUP. Falls back to
+  Simulation Mode like BatteryService (sim hooks: /tmp/neodct_sim_csq,
+  /tmp/neodct_sim_ring) and hot-adopts a modem that appears later.
+- Home screen signal bars are LIVE: the sig icon_set now renders 0-4 bars
+  from real tower CSQ (0 bars when unregistered); sim_val still applies in
+  Simulation Mode.
+- docs/MODEM_BRINGUP.md: full runbook -- QEMU passthrough gotchas (host
+  ModemManager, PID-switch warning), terminal proof-of-concept sequence,
+  S45modem config, ModemService integration notes, troubleshooting table.
+
 Version 0.2.4a - 2026-07-13
 
 Power/Battery

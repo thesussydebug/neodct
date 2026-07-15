@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# atcmd -- send one AT command to the SIM7600 and print the reply.
+#
+# Usage:  /NeoDCT/System/engineering/tools/atcmd [-p PORT] [-t SECONDS] "AT+CSQ"
+#         MODEM_PORT=/dev/ttyUSB3 atcmd AT
+#
+# Pure BusyBox (ash + stty + read -t). Serializes port access with the
+# same advisory lock ModemService and S45modem use, so replies never get
+# stolen by the UI's signal polling. Not for AT+CMGS (needs the ">" prompt).
+#
+# Exit codes: 0 reply ended in OK/CONNECT, 1 bad usage/port, 2 timeout,
+#             3 port busy, 4 modem returned an error/no-carrier final code.
+
+PORT="${MODEM_PORT:-/dev/ttyUSB2}"
+TIMEOUT=6
+LOCK=/tmp/neodct-modem.lock
+
+while getopts "p:t:" opt; do
+    case "$opt" in
+        p) PORT="$OPTARG" ;;
+        t) TIMEOUT="$OPTARG" ;;
+        *) echo "usage: atcmd [-p PORT] [-t SECONDS] \"AT...\"" >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+CMD="${1:-AT}"
+
+[ -c "$PORT" ] || { echo "atcmd: $PORT is not a character device (modem not enumerated?)" >&2; exit 1; }
+
+# One writer/reader at a time across atcmd, S45modem and ModemService.
+exec 9>>"$LOCK" 2>/dev/null
+if command -v flock >/dev/null 2>&1; then
+    tries=0
+    until flock -x -n 9; do
+        tries=$((tries + 1))
+        [ "$tries" -ge "$TIMEOUT" ] && { echo "atcmd: modem port busy (lock held)" >&2; exit 3; }
+        sleep 1
+    done
+fi
+
+stty -F "$PORT" 115200 raw -echo -echoe -echok clocal 2>/dev/null
+exec 3<>"$PORT" || { echo "atcmd: cannot open $PORT" >&2; exit 1; }
+
+printf '%s\r' "$CMD" >&3
+
+END=$(( $(date +%s) + TIMEOUT ))
+while :; do
+    LEFT=$(( END - $(date +%s) ))
+    [ "$LEFT" -gt 0 ] || { echo "atcmd: timeout waiting for final result" >&2; exit 2; }
+    IFS= read -r -t "$LEFT" LINE <&3 || continue
+    LINE=$(printf '%s' "$LINE" | tr -d '\r')
+    [ -n "$LINE" ] || continue
+    echo "$LINE"
+    case "$LINE" in
+        OK|CONNECT*) exit 0 ;;
+        ERROR|"+CME ERROR:"*|"+CMS ERROR:"*|"NO CARRIER"|"NO DIALTONE"|BUSY|"NO ANSWER") exit 4 ;;
+    esac
+done

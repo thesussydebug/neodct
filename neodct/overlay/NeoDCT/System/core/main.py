@@ -721,11 +721,14 @@ class NeoDCT_UI:
             self.draw.text((x, y), text, font=font, fill=el["color"])
 
         elif el["type"] == "icon_set":
-            # Battery gauge is live from the fuel gauge; other icon sets
-            # (cell signal) stay on the layout's sim_val until they get a
-            # real data source.
+            # Battery gauge and cell signal are live (fuel gauge / modem
+            # AT+CSQ). In modem Simulation Mode signal_level() is None and
+            # the layout's sim_val still applies, like before.
             if el.get("prefix") == "bat":
                 val = self.battery.level()
+            elif el.get("prefix") == "sig":
+                bars = self.modem.signal_level()
+                val = int(el.get("sim_val", 3)) if bars is None else bars
             else:
                 val = int(el.get("sim_val", 3))
             custom_path = el.get("custom_images", {}).get(str(val))
@@ -855,6 +858,16 @@ class NeoDCT_UI:
         if event == "shutdown":
             self._shutdown_low_battery()
 
+    def _modem_tick(self):
+        """Pump the modem's URC/CSQ polling from the same chokepoint as the
+        battery: read_keypress runs on every screen, so RING and signal
+        updates keep flowing inside apps and dialogs too. Rate limiting
+        lives inside ModemService.poll()."""
+        try:
+            self.modem.poll()
+        except Exception as exc:
+            print(f"[MODEM] Poll failed: {exc}")
+
     def _shutdown_low_battery(self):
         self._shutting_down = True
         vcell = self.battery.vcell() or 0.0
@@ -890,6 +903,7 @@ class NeoDCT_UI:
 
     def read_keypress(self, timeout=0.1):
         self._battery_tick()
+        self._modem_tick()
 
         # Primary path: GPIO matrix keymap (if present and initialized).
         # Backward-compatible fallback: still read evdev keyboard events.

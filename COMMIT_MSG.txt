@@ -16,3 +16,54 @@ removed):
 
 FuelGauge (diesel can) and LinuxShell (Tux) keep their icons.
 Also noted in the 0.2.4a CHANGELOG Engineering section.
+
+---
+
+kernel: persist SIM7600 modem drivers in qemu config, add option + qmi_wwan
+
+The /dev/ttyUSB* mystery solved: menuconfig had enabled the USB-serial
+core (CONFIG_USB_SERIAL) but never the actual modem driver
+(CONFIG_USB_SERIAL_OPTION), so nothing bound to the SIM7600's serial
+interfaces even though lsusb saw 1e0e:9001. Those USB changes also lived
+only in the ephemeral output/build .config — a clean rebuild would have
+silently lost them.
+
+board/qemu/aarch64-virt/linux.config:
+- wrote back the existing menuconfig work via `make linux-update-defconfig`
+  (USB_ACM, USB_SERIAL, USB_SERIAL_GENERIC, USB_USBNET, USB_NET_RNDIS_HOST)
+- added CONFIG_USB_SERIAL_OPTION=y: the Qualcomm/SIMCom serial driver;
+  1e0e:9001 is in its device table (SIMCOM_PRODUCT_SIM7100E, shared with
+  SIM7600), so it auto-binds and creates ttyUSB0-5 — no new_id hack needed
+- added CONFIG_USB_NET_QMI_WWAN=y: gives wwan0 at the default PID 9001,
+  dialable with plain AT$QCRMCALL=1,1 over the AT port — kernel driver
+  only, no libqmi/ModemManager userspace needed
+
+Also .claude/settings.json: allow background Claude sessions to edit
+this checkout directly (worktrees can't reach the buildroot output tree).
+
+---
+
+MODEM SUPPORT: real ModemService, boot auto-connect, live signal bars
+
+Three-stage bring-up for the SIM7600G on T-Mobile, all BusyBox + kernel
+drivers + Python -- no ModemManager/libqmi/pyserial (64 MB RAM budget):
+
+- engineering/tools/atcmd: scriptable one-shot AT commands from the
+  shell, lock-safe against the UI and boot script (terminal PoC stage).
+- /etc/init.d/S45modem: backgrounded boot bring-up -- SIM check, IPv6
+  PDP context (fast.t-mobile.com), CEREG registration wait, AT$QCRMCALL
+  data call, wwan0 up + SLAAC + DNS64 nameservers. Config via
+  /etc/default/modem, log at /tmp/modem-boot.log.
+- ModemService rewritten from stub to real AT driver: raw termios port
+  ownership, sysfs interface-number port probe with AT->OK confirm,
+  staggered CSQ/CEREG/COPS polling pumped from read_keypress (same
+  chokepoint as the battery tick), URC state machine (RING/+CLIP/VOICE
+  CALL/NO CARRIER) with a latched event queue, real ATD;/AT+CHUP dial
+  and hangup, Simulation Mode fallback with /tmp sim hooks, hotplug
+  re-probe every 10 s.
+- Home screen sig icon_set is live: 0-4 bars from real tower CSQ, 0 when
+  unregistered, layout sim_val in Simulation Mode.
+- docs/MODEM_BRINGUP.md runbook + 0.3.0a changelog section.
+
+Sim-mode state machine covered by an ad-hoc test sweep (bars mapping,
+dial/connect/hangup, ring hook, URC parsers, snapshot).
