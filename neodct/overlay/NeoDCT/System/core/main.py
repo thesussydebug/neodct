@@ -705,6 +705,11 @@ class NeoDCT_UI:
         if el["type"] == "text":
             text = el["text"]
             if text == "12:00": text = time.strftime("%H:%M")
+            elif text == "No Service":
+                # Registered modem -> real carrier name (Tello/T-Mobile);
+                # otherwise the layout's placeholder stands.
+                carrier = self.modem.operator_display()
+                if carrier: text = carrier
             
             # Font Selection
             if el["font_size"] >= 20: font = self.font_xl

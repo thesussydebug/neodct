@@ -16,12 +16,20 @@ helper with an advisory flock on LOCK_FILE. Whoever holds the lock wins;
 everyone else skips that transaction and retries on a later tick, so the
 UI never garbles the boot script's registration dance.
 
+Real call placement is fenced off while the voice path is under
+construction: unless the system.modem.allow_calls setting is ON, dial()
+and answer() never send ATD/ATA to the hardware -- they run the same
+pretend flow as Simulation Mode (CALLING -> CONNECTED after 2 s) while
+signal/operator/URC tracking stays real. Flip the setting when calls are
+actually ready.
+
 If no AT port answers, the service runs in Simulation Mode (boot log says
 so, like BatteryService) and quietly re-probes every PROBE_RETRY_S, so a
 modem hotplugged later is adopted automatically. Sim hooks for QEMU
 without passthrough:
-  echo 23 > /tmp/neodct_sim_csq        # drive the signal bars (0-31, 99)
-  echo 5551234 > /tmp/neodct_sim_ring  # fake an incoming call (rm = hangup)
+  echo 23 > /tmp/neodct_sim_csq         # drive the signal bars (0-31, 99)
+  echo 5551234 > /tmp/neodct_sim_ring   # fake an incoming call (rm = hangup)
+  echo Tello > /tmp/neodct_sim_operator # fake the home-screen carrier line
 """
 
 import fcntl
@@ -33,6 +41,7 @@ from collections import deque
 LOCK_FILE = "/tmp/neodct-modem.lock"
 SIM_CSQ_FILE = "/tmp/neodct_sim_csq"
 SIM_RING_FILE = "/tmp/neodct_sim_ring"
+SIM_OPS_FILE = "/tmp/neodct_sim_operator"
 
 DEFAULT_PORT = "AUTO"          # AUTO probes ttyUSB2/3 first, then the rest
 BAUD = termios.B115200
@@ -76,6 +85,7 @@ class ModemService:
         self._next_probe = 0.0
         self._sim_connect_at = None
         self._configured_port = port or self._port_from_settings()
+        self._allow_calls = self._calls_enabled_setting()
 
         self._lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o666)
 
@@ -94,6 +104,15 @@ class ModemService:
         except Exception as exc:
             print(f"[MODEM] Settings unavailable ({exc}); probing default ports.")
             return DEFAULT_PORT
+
+    @staticmethod
+    def _calls_enabled_setting():
+        try:
+            from System.core.SettingsStorage import get_setting
+            val = str(get_setting("system.modem.allow_calls", "OFF"))
+            return val.strip().upper() in ("ON", "1", "TRUE", "YES")
+        except Exception:
+            return False   # fail safe: never place real calls by accident
 
     def _candidate_ports(self):
         if self._configured_port and self._configured_port != "AUTO":
@@ -175,12 +194,16 @@ class ModemService:
         self._transact("AT+CMEE=2")     # verbose errors
         self._transact("AT+CLIP=1")     # caller ID URCs
         self._transact("AT+CVHU=0")     # make hangup commands actually hang up
+        self._transact("AT+COPS=3,1")   # short operator names ("T-Mobile", "Tello")
         final, lines = self._transact("AT+CGSN", timeout=2.0)
         if final == "OK":
             digits = [ln for ln in lines if ln.strip().isdigit()]
             self.imei = digits[0].strip() if digits else None
         print("[MODEM] SIM7600 on %s (IMEI %s). Using REAL modem."
               % (self.port, self.imei or "unknown"))
+        if not self._allow_calls:
+            print("[MODEM] Real call placement DISABLED "
+                  "(system.modem.allow_calls=OFF); dial/answer will simulate.")
 
     # --- locking ---------------------------------------------------------
 
@@ -326,6 +349,14 @@ class ModemService:
         """Cheap periodic pump; call every UI tick (rate-limited inside)."""
         now = time.monotonic()
 
+        # Pretend-dial completion: used by Simulation Mode AND by real
+        # hardware while system.modem.allow_calls is OFF.
+        if self._sim_connect_at and self.state == "CALLING" \
+                and now >= self._sim_connect_at:
+            self._sim_connect_at = None
+            self.state = "CONNECTED"
+            self._events.append(("connected", None))
+
         if not self.hardware:
             self._poll_sim(now)
             return
@@ -384,13 +415,6 @@ class ModemService:
             self.state = "IDLE"
             self._events.append(("ended", "sim caller gave up"))
 
-        # Simulated dial "connects" two seconds after dial().
-        if self.state == "CALLING" and self._sim_connect_at \
-                and now >= self._sim_connect_at:
-            self._sim_connect_at = None
-            self.state = "CONNECTED"
-            self._events.append(("connected", None))
-
         # Re-probe for late/hotplugged hardware (e.g. modem enumerated
         # after the UI started, or QEMU passthrough attached on the fly).
         if now >= self._next_probe:
@@ -404,7 +428,9 @@ class ModemService:
         print(f"[MODEM] Requesting Dial: {number}")
         if not number:
             return False
-        if not self.hardware:
+        if not self.hardware or not self._allow_calls:
+            if self.hardware:
+                print("[MODEM] Calls not enabled yet; simulating this dial.")
             self.state = "CALLING"
             self._sim_connect_at = time.monotonic() + 2.0
             return True
@@ -416,7 +442,7 @@ class ModemService:
         return False
 
     def answer(self):
-        if not self.hardware:
+        if not self.hardware or not self._allow_calls:
             self.state = "CONNECTED"
             return True
         final, _ = self._command("ATA", timeout=8.0)
@@ -427,10 +453,12 @@ class ModemService:
 
     def hangup(self):
         print("[MODEM] Requesting Hangup")
+        self._sim_connect_at = None
         if not self.hardware:
             self.state = "IDLE"
-            self._sim_connect_at = None
             return True
+        # AT+CHUP is safe with no call up, and it also rejects a live
+        # incoming RING even while allow_calls is OFF.
         final, _ = self._command("AT+CHUP", timeout=5.0)
         if final != "OK":
             final, _ = self._command("ATH", timeout=5.0)
@@ -467,6 +495,23 @@ class ModemService:
             if csq >= threshold:
                 bars += 1
         return bars
+
+    def operator_display(self):
+        """Carrier line for the home screen ("Tello", "T-Mobile", ...).
+
+        None means keep the layout's placeholder text ("No Service"):
+        not registered, operator not read yet, or Simulation Mode without
+        the /tmp/neodct_sim_operator hook.
+        """
+        if not self.hardware:
+            try:
+                with open(SIM_OPS_FILE) as f:
+                    return f.read().strip() or None
+            except Exception:
+                return None
+        if not self.registered():
+            return None
+        return self.operator
 
     def take_pending_event(self):
         """Pop the oldest latched event tuple (kind, detail), or None."""

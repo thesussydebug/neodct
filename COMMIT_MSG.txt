@@ -63,7 +63,79 @@ drivers + Python -- no ModemManager/libqmi/pyserial (64 MB RAM budget):
   re-probe every 10 s.
 - Home screen sig icon_set is live: 0-4 bars from real tower CSQ, 0 when
   unregistered, layout sim_val in Simulation Mode.
+- Home screen "No Service" text is live too: shows the registered
+  operator's short name (AT+COPS=3,1 -> "Tello"/"T-Mobile") and falls
+  back to No Service when unregistered/simulated.
+- Real call placement gated behind system.modem.allow_calls (default
+  OFF): dial/answer pretend (2 s fake connect) until the voice path is
+  ready, so Call can't ring a real number by accident. AT+CHUP still
+  goes out on hardware (idle-safe, rejects real incoming rings).
 - docs/MODEM_BRINGUP.md runbook + 0.3.0a changelog section.
 
+- New Modem engineering app (id 9005): three softkey-walked status pages
+  (RADIO / SIM / DATA) in the FuelGauge style -- operator/CEREG/CSQ+dBm,
+  CPIN/phone number/IMEI/ICCID/IMSI/firmware (one-shot queries), and
+  S45modem status/wwan/IPv6/APN/DNS. Stays useful in Simulation Mode
+  (shows which ttyUSB nodes exist). Placeholder signal-bars icon pending
+  real art.
+
 Sim-mode state machine covered by an ad-hoc test sweep (bars mapping,
-dial/connect/hangup, ring hook, URC parsers, snapshot).
+dial/connect/hangup, ring hook, URC parsers, snapshot), and the Modem
+app's row builders by a stub-modem sweep (incl. CICCID->CCID fallback).
+
+---
+
+MusicPlayer: album art fix — sidecar folder-art fallback
+
+Album art never showed for the on-device library. Root cause: those
+mp3s carry full ID3v2.4 text tags but no embedded APIC frame at all
+(verified with mutagen + raw scan for JPEG/PNG magic), and the player
+only ever looked for APIC.
+
+- get_metadata now falls back to sidecar art next to the track:
+  cover/folder/front/album/albumart + .jpg/.jpeg/.png, case-
+  insensitive. Works for .wav/.aac and without mutagen too.
+- APIC loop now tries every APIC frame instead of giving up after
+  the first unreadable one.
+
+Verified offscreen with a FakeUI harness driving the real
+run_now_playing: sidecar cover.jpg renders, embedded-APIC file still
+renders, no-art file still gets the note placeholder. Drop a
+cover.jpg into /NeoDCT/User/music/ (or the album folder) for art on
+the current library.
+
+---
+
+MusicPlayer: swap mpv subprocess for in-process miniaudio streaming
+
+Playing a track no longer spawns mpv (~24MB private RSS, the OOM
+killer's first pick on the 64MB targets). The new _MiniaudioPlayer
+streams the file chunk-by-chunk through python-miniaudio into one
+ALSA device -- kilobytes of buffer, no spawn latency, and a single
+ALSA client (same reasoning as Koki's mixer).
+
+- pause/resume = device stop/start with the same stream generator
+  (it keeps its position), replacing SIGSTOP/SIGCONT on mpv
+- progress bar shows the real decoded-frame position; the wall-clock
+  estimate remains only for the mpv fallback
+- end-of-track via stream_with_callbacks end_callback
+- stream decode buffer sized to the device period (default 500ms,
+  NEODCT_MUSIC_ABUF_MS overrides): miniaudio raises mid-callback if
+  the device asks for more frames than frames_to_read allocated --
+  found by the headless test; the track would hang silent forever
+- mpv kept as automatic fallback when miniaudio is missing or its
+  device fails to init; a bad file (DecodeError) does NOT demote the
+  session to mpv. NEODCT_MUSIC_AUDIO=subprocess|miniaudio forces a
+  backend (same convention as NEODCT_KOKI_AUDIO)
+- flac/ogg now scanned + playable; aac only via the mpv fallback
+  (miniaudio has no aac decoder)
+- wav/flac/ogg durations via miniaudio.get_file_info (mutagen only
+  handled mp3)
+- BR2_PACKAGE_PYTHON_MINIAUDIO=y added to qemu + luckfox defconfigs
+  (it lived only in the live .config; a clean rebuild would drop it)
+
+Verified headlessly (NULL backend, real app module, UI stubbed):
+play/pause/resume/position, end detection, replay after stop,
+bad-file and device-failure fallback paths, plus a real mp3 decode
+sweep -- 17 checks + mp3, all green. Also noted in the 0.3.0a
+CHANGELOG MusicPlayer section.

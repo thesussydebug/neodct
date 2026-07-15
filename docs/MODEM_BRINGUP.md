@@ -115,17 +115,31 @@ probe-or-simulate pattern as BatteryService):
 * **Port auto-probe**: prefers USB interface 2, then 3 (read from sysfs),
   confirms with `AT`→`OK`; re-probes every 10 s if the modem is missing,
   so passthrough/hotplug attach after boot is adopted automatically.
-* **Real call control**: `dial()` sends `ATD<number>;`, `hangup()` sends
-  `AT+CHUP`. URCs (`RING`, `+CLIP`, `VOICE CALL: BEGIN/END`, `NO CARRIER`)
-  update `modem.state` and queue events (`take_pending_event()`) for the
-  incoming-call UI to come.
+* **Live carrier line**: the home screen's "No Service" text becomes the
+  real operator name ("Tello" / "T-Mobile", short-format `AT+COPS=3,1`)
+  once registered; it falls back to "No Service" whenever registration
+  drops.
+* **Call control (SAFETY-GATED)**: real `ATD<number>;` / `ATA` are only
+  sent when the `system.modem.allow_calls` setting is ON — it defaults
+  OFF while the voice path isn't ready, so pressing Call just pretends
+  (2 s fake connect) even with a live registered modem. `hangup()` always
+  sends `AT+CHUP` on hardware (harmless idle, and it rejects a real
+  incoming RING). URCs (`RING`, `+CLIP`, `VOICE CALL: BEGIN/END`,
+  `NO CARRIER`) update `modem.state` and queue events
+  (`take_pending_event()`) for the incoming-call UI to come.
 * **Coexistence**: every port transaction takes the advisory lock
   `/tmp/neodct-modem.lock`, shared with `atcmd` and `S45modem` — you can
   poke AT commands from the serial console while the UI runs.
 * **Sim hooks** (QEMU, no modem): `echo 23 > /tmp/neodct_sim_csq` drives
   the bars; `echo 5551234 > /tmp/neodct_sim_ring` fakes an incoming call
-  (`rm` it to "hang up"); dialing auto-"connects" after 2 s.
-* `status_snapshot()` / `send_at()` are ready for a Modem engineering app.
+  (`rm` it to "hang up"); `echo Tello > /tmp/neodct_sim_operator` fakes
+  the carrier line; dialing auto-"connects" after 2 s.
+* **Modem engineering app** (menu id 9005): RADIO / SIM / DATA status
+  pages, softkey walks Next→Next→Exit. Shows operator, CEREG, CSQ+dBm,
+  CPIN, phone number, IMEI, ICCID, IMSI, firmware, S45modem status, wwan
+  interface, IPv6, APN and DNS — troubleshooting without a serial
+  console. In Simulation Mode it lists which ttyUSB nodes exist instead
+  of bailing out.
 
 ## Troubleshooting
 

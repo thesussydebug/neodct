@@ -26,9 +26,44 @@ Modem (SIM7600G bring-up -- MODEM SUPPORT!)
 - Home screen signal bars are LIVE: the sig icon_set now renders 0-4 bars
   from real tower CSQ (0 bars when unregistered); sim_val still applies in
   Simulation Mode.
+- Home screen carrier line is LIVE: the "No Service" text shows the real
+  operator name ("Tello"/"T-Mobile", AT+COPS short format) while
+  registered, and reverts to No Service when registration drops.
+- Call placement is safety-gated while the voice path is unfinished:
+  dial()/answer() only send real ATD/ATA when the new
+  system.modem.allow_calls setting is ON (default OFF -> pretend flow,
+  2 s fake connect, even on live hardware). Hangup still sends AT+CHUP
+  (harmless when idle; rejects a real incoming ring).
 - docs/MODEM_BRINGUP.md: full runbook -- QEMU passthrough gotchas (host
   ModemManager, PID-switch warning), terminal proof-of-concept sequence,
   S45modem config, ModemService integration notes, troubleshooting table.
+- New Modem engineering app (id 9005, signal-bars placeholder icon):
+  three status pages walked with the softkey (Next/Next/Exit, Back exits
+  anywhere) in the FuelGauge readout style. RADIO: operator, CEREG state,
+  CSQ + dBm, bars, call state (1 s refresh). SIM: CPIN, phone number
+  (+CNUM), IMEI, ICCID (+CICCID with +CCID fallback), IMSI, firmware --
+  queried once per visit since identity never changes. DATA: S45modem
+  boot status, wwan interface + up/down, global IPv6, APN, DNS. Unlike
+  FuelGauge it does NOT exit in Simulation Mode: it shows which ttyUSB
+  nodes exist instead, so "why is there no modem" is debuggable on-screen
+  without a serial console.
+
+MusicPlayer
+- Playback engine swapped from spawned mpv processes to in-process
+  python-miniaudio streaming (same library as Koki's mixer): tracks
+  decode chunk-by-chunk straight into one ALSA device, so playing a song
+  costs kilobytes of buffer instead of a ~24MB mpv process (the usual
+  OOM trigger on real hardware). mpv remains an automatic fallback when
+  miniaudio is missing or its device fails (NEODCT_MUSIC_AUDIO=
+  subprocess forces mpv; =miniaudio disables the fallback).
+- flac/ogg now playable; aac only via the mpv fallback (miniaudio has
+  no aac decoder).
+- Progress bar/timestamps track the real decoded position under
+  miniaudio instead of the wall-clock estimate (which stays for mpv).
+- Track duration now reported for wav/flac/ogg too via miniaudio
+  get_file_info (mutagen only handled mp3).
+- BR2_PACKAGE_PYTHON_MINIAUDIO=y added to the qemu + luckfox defconfigs
+  (it lived only in the live .config; a clean rebuild would drop it).
 
 Version 0.2.4a - 2026-07-13
 
