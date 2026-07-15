@@ -48,6 +48,26 @@ Modem (SIM7600G bring-up -- MODEM SUPPORT!)
   nodes exist instead, so "why is there no modem" is debuggable on-screen
   without a serial console.
 
+Messages (SMS sending -- FIRST LIVE TELEPHONY!)
+- The Messages app really sends SMS now: Write Message -> Options ->
+  Send prompts a "Number" TextInput, then hands off to the modem and
+  reports "Message sent!" (with the network's +CMGS reference) or the
+  exact failure. The old "requires Telephony... by M3" placeholder is
+  gone from both the composer and the Outbox draft Send option.
+- Pressing any arrow key on the Number prompt opens the shared PhoneBook
+  contact selector (first real use of that groundwork) and autofills the
+  picked contact's number.
+- ModemService.send_sms(): text-mode AT+CMGS with bespoke handling for
+  the ">" prompt (it arrives without a newline, invisible to the line
+  reader), 30 s network-ack window, ESC bailout if the prompt never
+  comes, CMS/CME error reporting, and ascii-safe body encoding. Verified
+  end-to-end against a pty-based fake modem speaking the real CMGS
+  dance, plus rejection/validation paths. Simulation Mode pretends
+  honestly ("simulated").
+- Receiving is deliberately not wired yet -- one step at a time.
+- Guardrails: empty drafts and >160-char messages are stopped in the app
+  with a clear dialog before the modem is ever touched.
+
 MusicPlayer
 - Playback engine swapped from spawned mpv processes to in-process
   python-miniaudio streaming (same library as Koki's mixer): tracks

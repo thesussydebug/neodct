@@ -16,6 +16,10 @@ helper with an advisory flock on LOCK_FILE. Whoever holds the lock wins;
 everyone else skips that transaction and retries on a later tick, so the
 UI never garbles the boot script's registration dance.
 
+SMS sending is live via send_sms() (text-mode AT+CMGS with bespoke
+">"-prompt handling); receiving is deliberately NOT wired yet -- one
+step at a time.
+
 Real call placement is fenced off while the voice path is under
 construction: unless the system.modem.allow_calls setting is ON, dial()
 and answer() never send ATD/ATA to the hardware -- they run the same
@@ -47,6 +51,8 @@ DEFAULT_PORT = "AUTO"          # AUTO probes ttyUSB2/3 first, then the rest
 BAUD = termios.B115200
 
 POLL_URC_S = 0.5               # drain unsolicited lines this often
+SMS_PROMPT_TIMEOUT_S = 5.0     # AT+CMGS -> ">" prompt
+SMS_SEND_TIMEOUT_S = 30.0      # body+Ctrl-Z -> network ack (+CMGS/OK)
 POLL_SIGNAL_S = 5.0            # AT+CSQ cadence
 POLL_NET_S = 20.0              # AT+CEREG? cadence
 POLL_OPERATOR_S = 60.0         # AT+COPS? cadence
@@ -464,6 +470,100 @@ class ModemService:
             final, _ = self._command("ATH", timeout=5.0)
         self.state = "IDLE"
         return final == "OK"
+
+    # --- SMS ----------------------------------------------------------------
+
+    def send_sms(self, number, text):
+        """Send one text-mode SMS. Returns (ok, detail).
+
+        Real sending (no allow_calls-style gate: SMS *is* the first live
+        telephony feature). Simulation Mode pretends and reports so.
+        AT+CMGS needs bespoke I/O: the ">" prompt arrives with no newline,
+        so the line-based reader in _transact would wait forever.
+        """
+        number = "".join(c for c in str(number) if c in "0123456789*#+")
+        text = str(text).replace("\x1a", "").replace("\x1b", "")
+        if not number:
+            return False, "no number"
+        if not text:
+            return False, "empty message"
+        print(f"[MODEM] Sending SMS to {number} ({len(text)} chars)")
+
+        if not self.hardware:
+            print("[MODEM] (Simulation Mode: pretending the SMS went out.)")
+            self._events.append(("sms_sent", number))
+            return True, "simulated"
+
+        if not self._acquire():
+            return False, "modem port busy"
+        try:
+            final, _ = self._transact("AT+CMGF=1")   # text mode
+            if final != "OK":
+                return False, "text mode rejected (%s)" % final
+            try:
+                os.write(self.fd, b'AT+CMGS="' + number.encode("ascii") + b'"\r')
+            except OSError as exc:
+                self._drop_hardware(f"port write failed: {exc}")
+                return False, "modem lost"
+            if not self._wait_sms_prompt(SMS_PROMPT_TIMEOUT_S):
+                # ESC backs out of a half-open CMGS so the port isn't
+                # stuck eating everything we send next as message body.
+                try:
+                    os.write(self.fd, b"\x1b")
+                except OSError:
+                    pass
+                return False, "no > prompt from modem"
+            try:
+                os.write(self.fd, text.encode("ascii", "replace") + b"\x1a")
+            except OSError as exc:
+                self._drop_hardware(f"port write failed: {exc}")
+                return False, "modem lost"
+
+            deadline = time.monotonic() + SMS_SEND_TIMEOUT_S
+            ref = None
+            while time.monotonic() < deadline:
+                for line in self._read_pending():
+                    if line.startswith("+CMGS:"):
+                        ref = line.split(":", 1)[1].strip()
+                    elif line == "OK":
+                        print(f"[MODEM] SMS accepted by network (ref {ref}).")
+                        self._events.append(("sms_sent", number))
+                        return True, ref or "sent"
+                    elif line == "ERROR" or line.startswith(("+CMS ERROR", "+CME ERROR")):
+                        print(f"[MODEM] SMS rejected: {line}")
+                        return False, line
+                    elif line.startswith(URC_PREFIXES):
+                        self._handle_urc(line)
+                time.sleep(0.05)
+            return False, "timeout waiting for network"
+        finally:
+            self._release()
+
+    def _wait_sms_prompt(self, timeout):
+        """Wait for the raw '>' CMGS prompt (it never gets a newline)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                chunk = os.read(self.fd, 64)
+                if chunk:
+                    self._rxbuf += chunk
+            except BlockingIOError:
+                pass
+            except OSError:
+                return False
+            # Complete lines are errors/URCs; the prompt never ends a line.
+            while b"\n" in self._rxbuf:
+                raw, self._rxbuf = self._rxbuf.split(b"\n", 1)
+                line = raw.decode("ascii", "replace").strip()
+                if line == "ERROR" or line.startswith(("+CMS ERROR", "+CME ERROR")):
+                    return False
+                if line.startswith(URC_PREFIXES):
+                    self._handle_urc(line)
+            if b">" in self._rxbuf:
+                self._rxbuf = b""   # swallow the prompt and its trailing space
+                return True
+            time.sleep(0.02)
+        return False
 
     # --- readouts ----------------------------------------------------------
 

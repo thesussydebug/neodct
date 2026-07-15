@@ -139,3 +139,32 @@ play/pause/resume/position, end detection, replay after stop,
 bad-file and device-failure fallback paths, plus a real mp3 decode
 sweep -- 17 checks + mp3, all green. Also noted in the 0.3.0a
 CHANGELOG MusicPlayer section.
+
+---
+
+Messages: real SMS sending -- FIRST LIVE TELEPHONY
+
+Write Message -> Send now prompts for a number and hands the draft to
+the SIM7600 instead of the "requires Telephony... by M3" placeholder
+(also replaced on the Outbox draft Send option).
+
+- ModemService.send_sms(number, text): text-mode AT+CMGS with bespoke
+  ">"-prompt handling (the prompt has no newline, so the line-based
+  reader can't see it), 30 s network-ack window, ESC bailout when the
+  prompt never comes, +CMS/+CME error passthrough, ascii-safe body.
+  Sim Mode pretends and says so. No allow_calls-style gate: SMS is
+  the intended first live telephony feature.
+- New ContactNumberInput in Messages: TextInput subclass where any
+  arrow key opens the shared PhoneBook contact selector (first real
+  use of that groundwork) and autofills the contact's number. Its
+  (row, index) return is unpacked correctly -- note the Dialer's
+  existing target[2] unpack of the same selector is off-by-a-layer
+  and still needs the same fix.
+- App-side guardrails: empty and >160-char drafts stopped with a
+  dialog before touching the modem; "Sending..." screen during the
+  network wait; success/failure dialogs with the +CMGS ref or reason.
+- Receiving deliberately not wired yet (one step at a time).
+
+send_sms verified end-to-end against a pty fake modem speaking the
+real CMGS dance (prompt, body+Ctrl-Z, +CMGS ref, CMS ERROR reject),
+plus validation and sim paths. Messages app py_compile clean.

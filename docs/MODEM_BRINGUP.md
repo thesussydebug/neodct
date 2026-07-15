@@ -134,6 +134,11 @@ probe-or-simulate pattern as BatteryService):
   the bars; `echo 5551234 > /tmp/neodct_sim_ring` fakes an incoming call
   (`rm` it to "hang up"); `echo Tello > /tmp/neodct_sim_operator` fakes
   the carrier line; dialing auto-"connects" after 2 s.
+* **SMS sending is LIVE** (the first real telephony): Messages → Write
+  Message → Options → Send prompts for a number (arrow keys open the
+  PhoneBook contact picker) and sends via `ModemService.send_sms()` —
+  text-mode `AT+CMGS` with special handling for the newline-less `>`
+  prompt. Receiving is deliberately not wired yet.
 * **Modem engineering app** (menu id 9005): RADIO / SIM / DATA status
   pages, softkey walks Next→Next→Exit. Shows operator, CEREG, CSQ+dBm,
   CPIN, phone number, IMEI, ICCID, IMSI, firmware, S45modem status, wwan
