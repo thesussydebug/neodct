@@ -6,11 +6,15 @@ from System.ui.framework import (
     PagedList,
     HeaderWidget,
     SoftKeyBar,
+    TextInput,
     TextInputLong,
     VerticalList,
 )
+import System.apps.PhoneBook.shared.list_ui as contact_manager
 
 ROOT_ID_MESSAGES = 2  # matches "2-1" style header
+ARROW_KEYS = (103, 105, 106, 108)
+SMS_MAX_CHARS = 160  # one GSM text-mode segment
 DB_DIR = "/NeoDCT/User/db"
 INBOX_DB = f"{DB_DIR}/sms_inbox.db"
 OUTBOX_DB = f"{DB_DIR}/sms_outbox.db"
@@ -136,6 +140,95 @@ def _save_outbox_message(text):
     conn.commit()
     conn.close()
 
+class ContactNumberInput(TextInput):
+    """TextInput plus PhoneBook: any arrow key opens the shared contact
+    selector and autofills the picked contact's number."""
+
+    def show(self):
+        softkey = SoftKeyBar(self.ui)
+        softkey.update("OK")
+        cursor_on = True
+        last_blink = time.time()
+        self.draw(cursor_on)
+
+        while True:
+            if time.time() - last_blink > 0.5:
+                cursor_on = not cursor_on
+                last_blink = time.time()
+                self.draw(cursor_on)
+
+            key = self.ui.wait_for_key()
+            if key is None:
+                continue
+
+            if key in (28, 96):
+                return self.text
+            if key == 14:
+                if self.text:
+                    self.text = self.text[:-1]
+                    self.draw(cursor_on)
+                else:
+                    return None
+            elif key in ARROW_KEYS:
+                picked = contact_manager.show_contact_selector(
+                    self.ui, title="Contacts", btn_text="OK",
+                    header_root=f"{ROOT_ID_MESSAGES}-3")
+                if picked:
+                    contact, _ = picked   # row: (id, name, number, speed_dial)
+                    self.text = str(contact[2])
+                self.draw(cursor_on)
+                softkey.update("OK")
+            elif key in self.DEV_KEYMAP:
+                self.text += self.DEV_KEYMAP[key]
+                self.draw(cursor_on)
+
+
+def _draw_sending(ui, number):
+    screen_w, _, content_bottom, _ = _screen_metrics(ui)
+    ui.draw.rectangle((0, 0, screen_w, content_bottom), fill="black")
+    w, h = ui.get_text_size("Sending...", ui.font_n)
+    y = max(10, (content_bottom - h) // 2 - 12)
+    ui.draw.text(((screen_w - w) // 2, y), "Sending...", font=ui.font_n, fill="white")
+    w2, _ = ui.get_text_size(number, ui.font_s)
+    ui.draw.text(((screen_w - w2) // 2, y + h + 8), number, font=ui.font_s, fill="gray")
+    SoftKeyBar(ui).update("", present=False)
+    ui.fb.update(ui.canvas)
+
+
+def _send_message_flow(ui, text, root_id, sub_index):
+    """Number prompt (arrows open the contact picker) -> modem send ->
+    result dialog. Returns True when the network accepted the message."""
+    text = (text or "").strip()
+    if not text:
+        MessageDialog(ui, "Message is empty!").show()
+        return False
+    if len(text) > SMS_MAX_CHARS:
+        MessageDialog(ui, "Too long for one SMS (%d/%d)."
+                      % (len(text), SMS_MAX_CHARS)).show()
+        return False
+
+    number = ContactNumberInput(ui, "Send To", "Number:").show()
+    if number is None:
+        return False
+    number = "".join(c for c in number if c in "0123456789*#+")
+    if not number:
+        MessageDialog(ui, "No number given!").show()
+        return False
+
+    modem = getattr(ui, "modem", None)
+    if modem is None:
+        MessageDialog(ui, "ModemService is not running.").show()
+        return False
+
+    _draw_sending(ui, number)
+    ok, detail = modem.send_sms(number, text)
+    if ok:
+        MessageDialog(ui, "Message sent!").show()
+        return True
+    MessageDialog(ui, "Send failed: %s" % detail).show()
+    return False
+
+
 def _show_empty_state(ui, title, root_id, sub_index, message):
     screen_w, screen_h, content_bottom, header_y = _screen_metrics(ui)
 
@@ -210,10 +303,7 @@ def _show_message_detail(ui, title, root_id, sub_index, message, message_id=None
                     MessageDialog(ui, "Erased!").show()
                     return "deleted"
                 if selection == 1:
-                    MessageDialog(
-                        ui,
-                        "This feature requires Telephony. Will hopefully be functional by M3",
-                    ).show()
+                    _send_message_flow(ui, message, root_id, sub_index)
 
 def _show_inbox(ui, root_id, sub_index):
     while True:
@@ -301,10 +391,9 @@ def _show_write_message(ui, root_id, sub_index):
             options = VerticalList(ui, "Options", ["Send", "Save"], app_id=f"{root_id}-{sub_index}")
             selection = options.show()
             if selection == 0:
-                MessageDialog(
-                    ui,
-                    "This feature requires Telephony. Will hopefully be functional by M3",
-                ).show()
+                if _send_message_flow(ui, input_widget.get_text(), root_id, sub_index):
+                    return   # sent -- leave the composer
+                # failed/cancelled: fall through, keep the draft on screen
             elif selection == 1:
                 _save_outbox_message(input_widget.get_text())
                 MessageDialog(ui, "Saved!").show()

@@ -5,9 +5,15 @@ DEFAULTS = {
     "system.audio.ringtone": "/NeoDCT/System/tones/Entertainer.wma",
     "system.ui.wallpaper": "NONE",
     "system.ui.engineering_mode": "ON",
-    "system.os.versionnumber": "0.2.3a",
-    "system.os.versionname": "NeoDCT System v0.2.3a",
+    "system.os.versionnumber": "0.2.4a",
+    "system.os.versionname": "NeoDCT System v0.2.4a",
+    "system.hw.battery_i2c_bus": "1",
+    "system.hw.battery_i2c_addr": "0x36",
 }
+
+# Version strings track the installed build, not a user preference; refresh
+# them when an older settings.prop carries stale values.
+VERSION_KEYS = ("system.os.versionnumber", "system.os.versionname")
 
 
 def _parse_settings(text):
@@ -66,6 +72,10 @@ def load_with_defaults(defaults=None):
     for key, value in defaults.items():
         if key not in settings:
             settings[key] = value
+            changed = True
+    for key in VERSION_KEYS:
+        if key in defaults and settings.get(key) != defaults[key]:
+            settings[key] = defaults[key]
             changed = True
     if changed or not os.path.exists(SETTINGS_PATH):
         save_settings(settings)

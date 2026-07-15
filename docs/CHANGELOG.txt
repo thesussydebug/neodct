@@ -1,5 +1,138 @@
 NeoDCT Changelog
 
+Version 0.3.0a (in progress) - 2026-07-14
+
+Modem (SIM7600G bring-up -- MODEM SUPPORT!)
+- QEMU kernel config now ships the drivers the SIM7600 needs and they are
+  persisted in board/qemu/aarch64-virt/linux.config (they used to live only
+  in the ephemeral build .config): USB_SERIAL_OPTION (the driver that
+  actually creates /dev/ttyUSB0-4 for 1e0e:9001 -- its absence was why
+  lsusb saw the modem but no tty nodes appeared), plus QMI_WWAN for a
+  wwan0 interface at the stock PID, ACM/usbnet/RNDIS carried over.
+- New atcmd helper (engineering/tools/atcmd): one scriptable AT command
+  per call over BusyBox sh, with an advisory lock shared with the boot
+  script and the UI so replies never interleave.
+- New /etc/init.d/S45modem: backgrounded boot bring-up -- SIM check, PDP
+  context (IPV6 / fast.t-mobile.com by default, /etc/default/modem to
+  override), LTE registration wait, AT$QCRMCALL data call, wwan0 + SLAAC
+  + DNS64. Logs to /tmp/modem-boot.log, status in /tmp/modem.status.
+- ModemService is REAL now: owns the AT port via raw termios (no pyserial,
+  no ModemManager, no threads), auto-probes ports by USB interface number,
+  polls AT+CSQ/+CEREG/+COPS on staggered timers from the main loop, parses
+  call URCs (RING/+CLIP/VOICE CALL/NO CARRIER) into a state machine plus
+  event queue, and dial()/hangup() send real ATD/AT+CHUP. Falls back to
+  Simulation Mode like BatteryService (sim hooks: /tmp/neodct_sim_csq,
+  /tmp/neodct_sim_ring) and hot-adopts a modem that appears later.
+- Home screen signal bars are LIVE: the sig icon_set now renders 0-4 bars
+  from real tower CSQ (0 bars when unregistered); sim_val still applies in
+  Simulation Mode.
+- Home screen carrier line is LIVE: the "No Service" text shows the real
+  operator name ("Tello"/"T-Mobile", AT+COPS short format) while
+  registered, and reverts to No Service when registration drops.
+- Call placement is safety-gated while the voice path is unfinished:
+  dial()/answer() only send real ATD/ATA when the new
+  system.modem.allow_calls setting is ON (default OFF -> pretend flow,
+  2 s fake connect, even on live hardware). Hangup still sends AT+CHUP
+  (harmless when idle; rejects a real incoming ring).
+- docs/MODEM_BRINGUP.md: full runbook -- QEMU passthrough gotchas (host
+  ModemManager, PID-switch warning), terminal proof-of-concept sequence,
+  S45modem config, ModemService integration notes, troubleshooting table.
+- New Modem engineering app (id 9005, signal-bars placeholder icon):
+  three status pages walked with the softkey (Next/Next/Exit, Back exits
+  anywhere) in the FuelGauge readout style. RADIO: operator, CEREG state,
+  CSQ + dBm, bars, call state (1 s refresh). SIM: CPIN, phone number
+  (+CNUM), IMEI, ICCID (+CICCID with +CCID fallback), IMSI, firmware --
+  queried once per visit since identity never changes. DATA: S45modem
+  boot status, wwan interface + up/down, global IPv6, APN, DNS. Unlike
+  FuelGauge it does NOT exit in Simulation Mode: it shows which ttyUSB
+  nodes exist instead, so "why is there no modem" is debuggable on-screen
+  without a serial console.
+
+Messages (SMS sending -- FIRST LIVE TELEPHONY!)
+- The Messages app really sends SMS now: Write Message -> Options ->
+  Send prompts a "Number" TextInput, then hands off to the modem and
+  reports "Message sent!" (with the network's +CMGS reference) or the
+  exact failure. The old "requires Telephony... by M3" placeholder is
+  gone from both the composer and the Outbox draft Send option.
+- Pressing any arrow key on the Number prompt opens the shared PhoneBook
+  contact selector (first real use of that groundwork) and autofills the
+  picked contact's number.
+- ModemService.send_sms(): text-mode AT+CMGS with bespoke handling for
+  the ">" prompt (it arrives without a newline, invisible to the line
+  reader), 30 s network-ack window, ESC bailout if the prompt never
+  comes, CMS/CME error reporting, and ascii-safe body encoding. Verified
+  end-to-end against a pty-based fake modem speaking the real CMGS
+  dance, plus rejection/validation paths. Simulation Mode pretends
+  honestly ("simulated").
+- Receiving is deliberately not wired yet -- one step at a time.
+- Guardrails: empty drafts and >160-char messages are stopped in the app
+  with a clear dialog before the modem is ever touched.
+
+MusicPlayer
+- Playback engine swapped from spawned mpv processes to in-process
+  python-miniaudio streaming (same library as Koki's mixer): tracks
+  decode chunk-by-chunk straight into one ALSA device, so playing a song
+  costs kilobytes of buffer instead of a ~24MB mpv process (the usual
+  OOM trigger on real hardware). mpv remains an automatic fallback when
+  miniaudio is missing or its device fails (NEODCT_MUSIC_AUDIO=
+  subprocess forces mpv; =miniaudio disables the fallback).
+- flac/ogg now playable; aac only via the mpv fallback (miniaudio has
+  no aac decoder).
+- Progress bar/timestamps track the real decoded position under
+  miniaudio instead of the wall-clock estimate (which stays for mpv).
+- Track duration now reported for wav/flac/ogg too via miniaudio
+  get_file_info (mutagen only handled mp3).
+- BR2_PACKAGE_PYTHON_MINIAUDIO=y added to the qemu + luckfox defconfigs
+  (it lived only in the live .config; a clean rebuild would drop it).
+
+Version 0.2.4a - 2026-07-13
+
+Power/Battery
+- New BatteryService (System/core/BatteryService): reads VCELL from a
+  MAX1704x fuel gauge over I2C (bus/addr configurable via
+  system.hw.battery_i2c_bus / system.hw.battery_i2c_addr, default 1/0x36).
+- Home screen battery gauge is now live: <3.35 V dead (bat-0), 0.20 V bands
+  up to >=3.95 V full (bat-4). Readings are smoothed over a 5-sample window.
+- LOW BATTERY! warning at <=3.45 V, BATTERY CRITICALLY LOW! at <=3.25 V
+  (one-shot, re-armed if the pack recovers), graceful poweroff at <=3.20 V
+  (confirmed over 3 consecutive polls; syncs filesystems first).
+- QEMU/dev fallback: without gauge hardware the service runs in Simulation
+  Mode (boot log says which mode is active, like the modem stub). Simulated
+  voltage overridable via NEODCT_BATT_SIM_VCELL env var or by writing a
+  value to /tmp/neodct_sim_vcell at runtime.
+- Added engineering/tools/max1704x_watch.py bench utility used for the
+  Raspberry Pi supply-sweep prototyping.
+
+Engineering
+- New FuelGauge engineering app (id 9004, diesel-can icon): live MAX1704x
+  readout (VCELL/SOC/CRATE/VERSION/CONFIG + system gauge state) refreshed
+  every second through the shared BatteryService handle. Softkey issues a
+  gauge quick-start (re-seeds SOC from VCELL for bench sweeps). Shows a
+  notice and exits when the gauge is simulated (QEMU / missing hardware),
+  like the other hardware-bound engineering apps.
+- BatteryService grew debug_snapshot() and quickstart() to back the app.
+- Engineering apps finally lost the hard-hat placeholder icon: CubeBench
+  (3D cube), KeypadMapper (access-keypad photo), KeypadMapperI2C (same
+  photo + I2C badge), Crash (red X ball, redrawn crisp), LCDTest
+  (monitor) and Tests (checklist clipboard). All 120x120 transparent
+  PNGs; FuelGauge and LinuxShell keep their existing icons.
+
+Framework
+- MessageDialog.render() draws a dialog without blocking on a key;
+  ErrorScreen.show_error(wait_for_ack=False) exposes it for the shutdown
+  notice.
+- MessageDialog layout fixes: body text no longer overlaps the warning
+  icon (affected every dialog incl. the alpha notice), the body block is
+  vertically centered, and short notices (<=2 lines) now render
+  Nokia-alert style: normal font, centered. Paragraphs keep the small
+  left-aligned layout.
+- Home layout icon_set elements now honor sim_val instead of a hardcoded
+  level (cell signal still simulated until the modem goes real).
+
+Versioning
+- Version bumped to 0.2.4a; stale version strings in an existing
+  settings.prop are now refreshed to the installed build.
+
 Version 0.2.0a - 2026-02-25
 
 Summary

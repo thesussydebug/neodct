@@ -26,6 +26,7 @@ def show_error(
     button_text="OK",
     accept_keys=(28,),
     cancel_keys=(14,),
+    wait_for_ack=True,
 ):
     dlg = MessageDialog(
         ui,
@@ -36,6 +37,11 @@ def show_error(
         accept_keys=accept_keys,
         cancel_keys=cancel_keys,
     )
+    if not wait_for_ack:
+        # Draw-only path for notices the user cannot dismiss (e.g. the
+        # low-battery shutdown screen); the caller owns what happens next.
+        dlg.render()
+        return None
     return dlg.show()
 
 

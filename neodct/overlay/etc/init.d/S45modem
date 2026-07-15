@@ -1,0 +1,173 @@
+#!/bin/sh
+#
+# S45modem -- bring the SIM7600 onto the cellular network at boot.
+#
+# Strategy (per the 0.3.0a modem plan): no ModemManager, no libqmi. The
+# option driver gives us AT ports, qmi_wwan gives us wwan0, and the modem
+# firmware does the heavy lifting via AT$QCRMCALL. T-Mobile is IPv6-only
+# (NAT64/DNS64), so the default context is IPV6 + SLAAC.
+#
+# Everything runs backgrounded so boot never blocks on cell registration.
+# Progress log: /tmp/modem-boot.log   Status flag: /tmp/modem.status
+# Config overrides: /etc/default/modem (plain sh vars, all optional).
+#
+# The UI's ModemService only reads status (CSQ/CEREG/COPS) and shares the
+# /tmp/neodct-modem.lock advisory lock with atcmd, so both can coexist.
+
+ATCMD=/NeoDCT/System/engineering/tools/atcmd
+
+MODEM_PORT="${MODEM_PORT:-/dev/ttyUSB2}"
+MODEM_APN="${MODEM_APN:-fast.t-mobile.com}"
+MODEM_PDPTYPE="${MODEM_PDPTYPE:-IPV6}"       # IPV6 | IP | IPV4V6
+MODEM_RAW_IP="${MODEM_RAW_IP:-auto}"         # auto | y | n  (qmi_wwan framing)
+MODEM_DNS="${MODEM_DNS:-2001:4860:4860::6464 2001:4860:4860::64}"  # Google DNS64
+MODEM_PORT_WAIT_S=30
+MODEM_REG_WAIT_S=90
+
+[ -r /etc/default/modem ] && . /etc/default/modem
+
+LOG=/tmp/modem-boot.log
+STATUS=/tmp/modem.status
+PIDFILE=/tmp/modem-boot.pid
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"
+}
+
+fail() {
+    log "FAILED: $*"
+    echo "failed: $*" > "$STATUS"
+    exit 1
+}
+
+at() {
+    "$ATCMD" -p "$MODEM_PORT" -t "${2:-6}" "$1" 2>> "$LOG"
+}
+
+worker() {
+    : > "$LOG"
+    echo "starting" > "$STATUS"
+    log "SIM7600 bring-up: port=$MODEM_PORT apn=$MODEM_APN type=$MODEM_PDPTYPE"
+
+    # 1. Wait for the option driver to enumerate the AT port.
+    waited=0
+    until [ -c "$MODEM_PORT" ]; do
+        waited=$((waited + 1))
+        [ "$waited" -ge "$MODEM_PORT_WAIT_S" ] && fail "$MODEM_PORT never appeared (no modem?)"
+        sleep 1
+    done
+    log "AT port present after ${waited}s"
+
+    # 2. Basic AT handshake (modem may still be settling right after enum).
+    tries=0
+    until at "AT" 3 | grep -q '^OK$'; do
+        tries=$((tries + 1))
+        [ "$tries" -ge 5 ] && fail "modem not answering AT on $MODEM_PORT"
+        sleep 2
+    done
+    at "ATE0" >> /dev/null
+    at "AT+CMEE=2" >> /dev/null
+    log "modem answering; echo off"
+
+    # 3. SIM check.
+    if ! at "AT+CPIN?" | grep -q "READY"; then
+        fail "SIM not ready (locked or missing) -- check AT+CPIN?"
+    fi
+    log "SIM ready"
+
+    # 4. Define the PDP context (cid 1).
+    at "AT+CGDCONT=1,\"$MODEM_PDPTYPE\",\"$MODEM_APN\"" | grep -q '^OK$' \
+        || fail "AT+CGDCONT rejected"
+    log "PDP context 1 = $MODEM_PDPTYPE / $MODEM_APN"
+
+    # 5. Wait for LTE registration (home or roaming).
+    waited=0
+    while :; do
+        REG=$(at "AT+CEREG?" | grep '+CEREG:')
+        case "$REG" in
+            *": "*",1"*|*": "*",5"*) log "registered: $REG"; break ;;
+        esac
+        waited=$((waited + 2))
+        if [ "$waited" -ge "$MODEM_REG_WAIT_S" ]; then
+            log "last CEREG: $REG   CSQ: $(at 'AT+CSQ' | grep '+CSQ')"
+            fail "no LTE registration after ${MODEM_REG_WAIT_S}s"
+        fi
+        sleep 2
+    done
+    log "signal: $(at 'AT+CSQ' | grep '+CSQ')  operator: $(at 'AT+COPS?' | grep '+COPS')"
+
+    # 6. Start the RmNet data call on cid 1 (firmware-driven, no libqmi).
+    at 'AT$QCRMCALL=1,1' 15 | tee -a "$LOG" | grep -q '^OK$' \
+        || fail 'AT$QCRMCALL=1,1 rejected'
+    log "data call started"
+
+    # 7. Host side: find the qmi_wwan interface and bring it up.
+    WWAN_IF=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^(wwan|rmnet)') || true
+    [ -n "$WWAN_IF" ] || WWAN_IF=usb0
+    [ -d "/sys/class/net/$WWAN_IF" ] || fail "no wwan network interface found"
+
+    if [ "$MODEM_RAW_IP" = "y" ] && [ -w "/sys/class/net/$WWAN_IF/qmi/raw_ip" ]; then
+        ip link set "$WWAN_IF" down 2>> "$LOG"
+        echo Y > "/sys/class/net/$WWAN_IF/qmi/raw_ip"
+        log "$WWAN_IF switched to raw-ip framing"
+    fi
+
+    sysctl -qw "net.ipv6.conf.$WWAN_IF.accept_ra=2" \
+               "net.ipv6.conf.$WWAN_IF.disable_ipv6=0" 2>> "$LOG"
+    ip link set "$WWAN_IF" up 2>> "$LOG" || fail "ip link set $WWAN_IF up"
+    log "$WWAN_IF up"
+
+    # 8. Addressing: SLAAC for IPv6 (T-Mobile RAs), DHCP for IPv4 contexts.
+    case "$MODEM_PDPTYPE" in
+        *V6*|*v6*)
+            waited=0
+            until ip -6 addr show dev "$WWAN_IF" scope global 2>/dev/null | grep -q inet6; do
+                waited=$((waited + 2))
+                [ "$waited" -ge 30 ] && fail "no SLAAC address on $WWAN_IF (try MODEM_RAW_IP=y?)"
+                sleep 2
+            done
+            log "IPv6: $(ip -6 addr show dev "$WWAN_IF" scope global | grep inet6 | head -1)"
+            for ns in $MODEM_DNS; do
+                grep -q "$ns" /etc/resolv.conf 2>/dev/null || echo "nameserver $ns" >> /etc/resolv.conf
+            done
+            ;;
+    esac
+    case "$MODEM_PDPTYPE" in
+        IP|IPV4V6)
+            udhcpc -i "$WWAN_IF" -n -q -t 5 >> "$LOG" 2>&1 || log "udhcpc failed (v4 side)"
+            ;;
+    esac
+
+    # 9. Proof of life for the boot log.
+    if ping -6 -c 1 -W 3 2606:4700:4700::1111 >> /dev/null 2>&1; then
+        log "connectivity OK (ping6 2606:4700:4700::1111)"
+    else
+        log "no ping reply yet (route/DNS64 may still settle)"
+    fi
+
+    echo "up:$WWAN_IF" > "$STATUS"
+    log "DONE: $WWAN_IF is on the cellular network"
+}
+
+case "$1" in
+    start)
+        worker &
+        echo $! > "$PIDFILE"
+        echo "S45modem: bring-up running in background (log: $LOG)"
+        ;;
+    stop)
+        [ -r "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+        "$ATCMD" -p "$MODEM_PORT" -t 10 'AT$QCRMCALL=0,1' >> /dev/null 2>&1
+        echo "stopped" > "$STATUS"
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        cat "$STATUS" 2>/dev/null || echo "unknown"
+        ;;
+    *)
+        echo "usage: $0 {start|stop|restart|status}"
+        ;;
+esac

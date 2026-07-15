@@ -1,0 +1,170 @@
+fun icons for the engineering apps, no more hard hats
+
+Replaced the placeholder icons with real 120x120 transparent PNGs
+(sources from "neodct icons/", baked-in transparency checkerboards
+removed):
+
+- CubeBench: white 3D cube cut off its checker background (local
+  flatness + convex hull, since the cube faces match the checker colors)
+- KeypadMapper: access-keypad photo, checker background removed
+- KeypadMapperI2C: same keypad with a blue I2C corner badge (both
+  source jpgs were byte-identical)
+- Crash: red-ball/white-X redrawn crisp at 4x and downscaled (source
+  png was a tiny icon nearest-neighbor upscaled, hopelessly pixelated)
+- LCDTest: monitor icon trimmed, padded square and rescaled
+- Tests: new clipboard icon, two green checks and one red X
+
+FuelGauge (diesel can) and LinuxShell (Tux) keep their icons.
+Also noted in the 0.2.4a CHANGELOG Engineering section.
+
+---
+
+kernel: persist SIM7600 modem drivers in qemu config, add option + qmi_wwan
+
+The /dev/ttyUSB* mystery solved: menuconfig had enabled the USB-serial
+core (CONFIG_USB_SERIAL) but never the actual modem driver
+(CONFIG_USB_SERIAL_OPTION), so nothing bound to the SIM7600's serial
+interfaces even though lsusb saw 1e0e:9001. Those USB changes also lived
+only in the ephemeral output/build .config — a clean rebuild would have
+silently lost them.
+
+board/qemu/aarch64-virt/linux.config:
+- wrote back the existing menuconfig work via `make linux-update-defconfig`
+  (USB_ACM, USB_SERIAL, USB_SERIAL_GENERIC, USB_USBNET, USB_NET_RNDIS_HOST)
+- added CONFIG_USB_SERIAL_OPTION=y: the Qualcomm/SIMCom serial driver;
+  1e0e:9001 is in its device table (SIMCOM_PRODUCT_SIM7100E, shared with
+  SIM7600), so it auto-binds and creates ttyUSB0-5 — no new_id hack needed
+- added CONFIG_USB_NET_QMI_WWAN=y: gives wwan0 at the default PID 9001,
+  dialable with plain AT$QCRMCALL=1,1 over the AT port — kernel driver
+  only, no libqmi/ModemManager userspace needed
+
+Also .claude/settings.json: allow background Claude sessions to edit
+this checkout directly (worktrees can't reach the buildroot output tree).
+
+---
+
+MODEM SUPPORT: real ModemService, boot auto-connect, live signal bars
+
+Three-stage bring-up for the SIM7600G on T-Mobile, all BusyBox + kernel
+drivers + Python -- no ModemManager/libqmi/pyserial (64 MB RAM budget):
+
+- engineering/tools/atcmd: scriptable one-shot AT commands from the
+  shell, lock-safe against the UI and boot script (terminal PoC stage).
+- /etc/init.d/S45modem: backgrounded boot bring-up -- SIM check, IPv6
+  PDP context (fast.t-mobile.com), CEREG registration wait, AT$QCRMCALL
+  data call, wwan0 up + SLAAC + DNS64 nameservers. Config via
+  /etc/default/modem, log at /tmp/modem-boot.log.
+- ModemService rewritten from stub to real AT driver: raw termios port
+  ownership, sysfs interface-number port probe with AT->OK confirm,
+  staggered CSQ/CEREG/COPS polling pumped from read_keypress (same
+  chokepoint as the battery tick), URC state machine (RING/+CLIP/VOICE
+  CALL/NO CARRIER) with a latched event queue, real ATD;/AT+CHUP dial
+  and hangup, Simulation Mode fallback with /tmp sim hooks, hotplug
+  re-probe every 10 s.
+- Home screen sig icon_set is live: 0-4 bars from real tower CSQ, 0 when
+  unregistered, layout sim_val in Simulation Mode.
+- Home screen "No Service" text is live too: shows the registered
+  operator's short name (AT+COPS=3,1 -> "Tello"/"T-Mobile") and falls
+  back to No Service when unregistered/simulated.
+- Real call placement gated behind system.modem.allow_calls (default
+  OFF): dial/answer pretend (2 s fake connect) until the voice path is
+  ready, so Call can't ring a real number by accident. AT+CHUP still
+  goes out on hardware (idle-safe, rejects real incoming rings).
+- docs/MODEM_BRINGUP.md runbook + 0.3.0a changelog section.
+
+- New Modem engineering app (id 9005): three softkey-walked status pages
+  (RADIO / SIM / DATA) in the FuelGauge style -- operator/CEREG/CSQ+dBm,
+  CPIN/phone number/IMEI/ICCID/IMSI/firmware (one-shot queries), and
+  S45modem status/wwan/IPv6/APN/DNS. Stays useful in Simulation Mode
+  (shows which ttyUSB nodes exist). Placeholder signal-bars icon pending
+  real art.
+
+Sim-mode state machine covered by an ad-hoc test sweep (bars mapping,
+dial/connect/hangup, ring hook, URC parsers, snapshot), and the Modem
+app's row builders by a stub-modem sweep (incl. CICCID->CCID fallback).
+
+---
+
+MusicPlayer: album art fix — sidecar folder-art fallback
+
+Album art never showed for the on-device library. Root cause: those
+mp3s carry full ID3v2.4 text tags but no embedded APIC frame at all
+(verified with mutagen + raw scan for JPEG/PNG magic), and the player
+only ever looked for APIC.
+
+- get_metadata now falls back to sidecar art next to the track:
+  cover/folder/front/album/albumart + .jpg/.jpeg/.png, case-
+  insensitive. Works for .wav/.aac and without mutagen too.
+- APIC loop now tries every APIC frame instead of giving up after
+  the first unreadable one.
+
+Verified offscreen with a FakeUI harness driving the real
+run_now_playing: sidecar cover.jpg renders, embedded-APIC file still
+renders, no-art file still gets the note placeholder. Drop a
+cover.jpg into /NeoDCT/User/music/ (or the album folder) for art on
+the current library.
+
+---
+
+MusicPlayer: swap mpv subprocess for in-process miniaudio streaming
+
+Playing a track no longer spawns mpv (~24MB private RSS, the OOM
+killer's first pick on the 64MB targets). The new _MiniaudioPlayer
+streams the file chunk-by-chunk through python-miniaudio into one
+ALSA device -- kilobytes of buffer, no spawn latency, and a single
+ALSA client (same reasoning as Koki's mixer).
+
+- pause/resume = device stop/start with the same stream generator
+  (it keeps its position), replacing SIGSTOP/SIGCONT on mpv
+- progress bar shows the real decoded-frame position; the wall-clock
+  estimate remains only for the mpv fallback
+- end-of-track via stream_with_callbacks end_callback
+- stream decode buffer sized to the device period (default 500ms,
+  NEODCT_MUSIC_ABUF_MS overrides): miniaudio raises mid-callback if
+  the device asks for more frames than frames_to_read allocated --
+  found by the headless test; the track would hang silent forever
+- mpv kept as automatic fallback when miniaudio is missing or its
+  device fails to init; a bad file (DecodeError) does NOT demote the
+  session to mpv. NEODCT_MUSIC_AUDIO=subprocess|miniaudio forces a
+  backend (same convention as NEODCT_KOKI_AUDIO)
+- flac/ogg now scanned + playable; aac only via the mpv fallback
+  (miniaudio has no aac decoder)
+- wav/flac/ogg durations via miniaudio.get_file_info (mutagen only
+  handled mp3)
+- BR2_PACKAGE_PYTHON_MINIAUDIO=y added to qemu + luckfox defconfigs
+  (it lived only in the live .config; a clean rebuild would drop it)
+
+Verified headlessly (NULL backend, real app module, UI stubbed):
+play/pause/resume/position, end detection, replay after stop,
+bad-file and device-failure fallback paths, plus a real mp3 decode
+sweep -- 17 checks + mp3, all green. Also noted in the 0.3.0a
+CHANGELOG MusicPlayer section.
+
+---
+
+Messages: real SMS sending -- FIRST LIVE TELEPHONY
+
+Write Message -> Send now prompts for a number and hands the draft to
+the SIM7600 instead of the "requires Telephony... by M3" placeholder
+(also replaced on the Outbox draft Send option).
+
+- ModemService.send_sms(number, text): text-mode AT+CMGS with bespoke
+  ">"-prompt handling (the prompt has no newline, so the line-based
+  reader can't see it), 30 s network-ack window, ESC bailout when the
+  prompt never comes, +CMS/+CME error passthrough, ascii-safe body.
+  Sim Mode pretends and says so. No allow_calls-style gate: SMS is
+  the intended first live telephony feature.
+- New ContactNumberInput in Messages: TextInput subclass where any
+  arrow key opens the shared PhoneBook contact selector (first real
+  use of that groundwork) and autofills the contact's number. Its
+  (row, index) return is unpacked correctly -- note the Dialer's
+  existing target[2] unpack of the same selector is off-by-a-layer
+  and still needs the same fix.
+- App-side guardrails: empty and >160-char drafts stopped with a
+  dialog before touching the modem; "Sending..." screen during the
+  network wait; success/failure dialogs with the +CMGS ref or reason.
+- Receiving deliberately not wired yet (one step at a time).
+
+send_sms verified end-to-end against a pty fake modem speaking the
+real CMGS dance (prompt, body+Ctrl-Z, +CMGS ref, CMS ERROR reject),
+plus validation and sim paths. Messages app py_compile clean.

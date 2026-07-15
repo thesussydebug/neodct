@@ -20,11 +20,11 @@ from System.core.SettingsStorage import get_setting
 import importlib.util
 import sqlite3
 from System.core.ModemService import ModemService
+from System.core.BatteryService import BatteryService
 from System.core.CrashHandler import show_app_crash, log_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
-from System.core.ErrorScreen import show_alpha_security_notice_once
-from System.hw import battery
+from System.core.ErrorScreen import show_alpha_security_notice_once, show_error
 
 # --- CONFIG ---
 # 1. Allow loading images even if they are missing EOF markers
@@ -513,7 +513,9 @@ class NeoDCT_UI:
         init_databases()       
     
         self.modem = ModemService()
-        self.dial_buffer = "" 
+        self.battery = BatteryService()
+        self._shutting_down = False
+        self.dial_buffer = ""
         
         self.DEV_KEYMAP = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 
@@ -740,6 +742,11 @@ class NeoDCT_UI:
         if el["type"] == "text":
             text = el["text"]
             if text == "12:00": text = time.strftime("%H:%M")
+            elif text == "No Service":
+                # Registered modem -> real carrier name (Tello/T-Mobile);
+                # otherwise the layout's placeholder stands.
+                carrier = self.modem.operator_display()
+                if carrier: text = carrier
             
             # Font Selection
             if el["font_size"] >= 20: font = self.font_xl
@@ -756,29 +763,24 @@ class NeoDCT_UI:
             self.draw.text((x, y), text, font=font, fill=el["color"])
 
         elif el["type"] == "icon_set":
-            prefix = el.get("prefix")
+            # Battery gauge and cell signal are live (fuel gauge / modem
+            # AT+CSQ). In modem Simulation Mode signal_level() is None and
+            # the layout's sim_val still applies, like before.
             count = el.get("count", 5)
-            max_idx = max(0, count - 1)
+            bat_label = None
+            if el.get("prefix") == "bat":
+                val = self.battery.level()
+                if not self.battery.hardware:
+                    bat_label = "?"
+            elif el.get("prefix") == "sig":
+                bars = self.modem.signal_level()
+                val = int(el.get("sim_val", 3)) if bars is None else bars
+            else:
+                val = int(el.get("sim_val", 3))
+            custom_path = el.get("custom_images", {}).get(str(val))
             x = int((el["x"] / 240.0) * self.W)
             y = int((el["y"] / 240.0) * self.H)
 
-            # Battery uses the level sprites ("bars"). The charge level drives
-            # which sprite shows, but the percentage number stays in the backend
-            # (battery.read_percent()) and is NOT drawn near the icon -- only a
-            # '?' appears when no gauge is detected.
-            bat_label = None
-            if prefix == "bat":
-                percent = battery.read_percent()
-                if percent is None:
-                    val = 0
-                    bat_label = "?"
-                else:
-                    val = max(0, min(max_idx, round(percent / 100.0 * max_idx)))
-            else:
-                # Other indicators (e.g. signal) use their authored sim value.
-                val = max(0, min(max_idx, int(el.get("sim_val", max_idx))))
-
-            custom_path = el.get("custom_images", {}).get(str(val))
             vis_box = None
             if custom_path:
                 img = self._get_status_icon(custom_path)
@@ -930,7 +932,70 @@ class NeoDCT_UI:
         elif self.state == "MENU":
             self.render_menu()
 
+    def _battery_tick(self):
+        """Sample the fuel gauge and enforce the shutdown floor.
+
+        Lives in read_keypress because every screen (home loop, menus, apps,
+        modal dialogs) funnels through it, so the 3.20 V cutoff holds
+        system-wide. The poll itself is rate-limited inside BatteryService.
+        """
+        if self._shutting_down:
+            return
+        try:
+            event = self.battery.poll()
+        except Exception as exc:
+            print(f"[BATT] Poll failed: {exc}")
+            return
+        if event == "shutdown":
+            self._shutdown_low_battery()
+
+    def _modem_tick(self):
+        """Pump the modem's URC/CSQ polling from the same chokepoint as the
+        battery: read_keypress runs on every screen, so RING and signal
+        updates keep flowing inside apps and dialogs too. Rate limiting
+        lives inside ModemService.poll()."""
+        try:
+            self.modem.poll()
+        except Exception as exc:
+            print(f"[MODEM] Poll failed: {exc}")
+
+    def _shutdown_low_battery(self):
+        self._shutting_down = True
+        vcell = self.battery.vcell() or 0.0
+        print(f"[BATT] Battery empty (VCELL={vcell:.3f} V). Graceful shutdown.")
+        try:
+            show_error(self, "Battery empty. Shutting down...",
+                       title="LOW BATTERY", button_text=None, wait_for_ack=False)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(3)
+        os.sync()
+        rc = os.system("poweroff")
+        if rc != 0:
+            print(f"[BATT] poweroff failed (rc={rc}); resuming so dev sessions survive.")
+            self._shutting_down = False
+            return
+        # Freeze on the shutdown notice while init takes us down.
+        while True:
+            time.sleep(1)
+
+    def show_pending_battery_warning(self):
+        # Deferred to the home loop so a modal never lands mid-frame inside
+        # an app; latched warnings pop as soon as we are back on HOME.
+        if self.state not in ("HOME", "HOME_DIALING"):
+            return
+        warning = self.battery.take_pending_warning()
+        if warning is None:
+            return
+        message = "BATTERY CRITICALLY LOW!" if warning == "critical" else "LOW BATTERY!"
+        vcell = self.battery.vcell() or 0.0
+        print(f"[BATT] Warning: {message} (VCELL={vcell:.3f} V)")
+        show_error(self, message, title="Battery")
+
     def read_keypress(self, timeout=0.1):
+        self._battery_tick()
+        self._modem_tick()
+
         # Primary path: GPIO matrix keymap (if present and initialized).
         # Backward-compatible fallback: still read evdev keyboard events.
         if self.matrix_input is not None:
@@ -1023,6 +1088,7 @@ def run(fb):
     while True:
         try:
             ui.update()
+            ui.show_pending_battery_warning()
             key = ui.read_keypress(0.1)
             if key is not None:
                 print(f"[INPUT] Code: {key}")
