@@ -128,8 +128,12 @@ def draw_call_screen(ui, number, name=None):
 
 
     # --- Main labels (left aligned like the reference) ---
-    # "Call 1" line
-    label = "Call 1"
+    # Live progress from AT+CLCC: Calling... -> Ringing... -> Call 1.
+    modem = getattr(ui, "modem", None)
+    status, secs = ("CONNECTED", None)
+    if modem is not None and hasattr(modem, "call_status"):
+        status, secs = modem.call_status()
+    label = {"CALLING": "Calling...", "RINGING": "Ringing..."}.get(status, "Call 1")
     label_font = getattr(ui, "font_n", None) or getattr(ui, "font_s", None)
 
     label_x = max(34, int(screen_w * 0.23))
@@ -144,6 +148,12 @@ def draw_call_screen(ui, number, name=None):
 
     num_y = label_y + 26  # Nokia-ish spacing under the label
     ui.draw.text((label_x, num_y), fitted_num, font=num_font, fill="white")
+
+    # Connected: running mm:ss under the number.
+    if secs is not None:
+        timer_text = "%02d:%02d" % (secs // 60, secs % 60)
+        timer_font = getattr(ui, "font_s", num_font)
+        ui.draw.text((label_x, num_y + 24), timer_text, font=timer_font, fill="gray")
 
     # Optional: if you ever want the contact name too, you can add it above/below.
     # Keeping it off by default to match your request.
@@ -191,6 +201,13 @@ def show_calling(ui, number, name=None):
             key = ui.read_keypress(0.10)
         else:
             key = _read_keypress(fd, timeout=0.10)
+
+        # Remote hangup / call failure: read_keypress pumped the modem
+        # URCs (NO CARRIER, VOICE CALL: END), so IDLE means it's over.
+        modem = getattr(ui, "modem", None)
+        if modem is not None and modem.state == "IDLE":
+            return
+
         if key is None:
             continue
 

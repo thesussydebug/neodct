@@ -9,7 +9,7 @@ from System.core.SettingsStorage import set_setting
 ROOT_ID = 9
 SYSTEM_TONES_DIR = "/NeoDCT/System/tones"
 USER_TONES_DIR = "/NeoDCT/User/tones"
-SUPPORTED_EXTS = (".mp3", ".wma")
+SUPPORTED_EXTS = (".mp3")
 
 MPV_CMD = [
     "nice", "-n", "-10",

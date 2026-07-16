@@ -20,6 +20,7 @@ import importlib.util
 import sqlite3
 from System.core.ModemService import ModemService
 from System.core.BatteryService import BatteryService
+from System.core.NotifyService import NotifyService
 from System.core.CrashHandler import show_app_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
@@ -493,6 +494,8 @@ class NeoDCT_UI:
     
         self.modem = ModemService()
         self.battery = BatteryService()
+        self.notify = NotifyService()
+        self._unread_sms = self._count_unread_sms()
         self._shutting_down = False
         self.dial_buffer = ""
         
@@ -777,9 +780,33 @@ class NeoDCT_UI:
         # 2. Render Elements
         if self.home_layout:
             for el in self.home_layout["elements"]:
+                # The carrier line makes room for the "N messages
+                # received" banner, like on the 3310.
+                if self.notify.active() and el.get("type") == "text" \
+                        and el.get("text") == "No Service":
+                    continue
                 self.render_element(el)
         else:
             self.draw.text((10,10), "No Layout Found", fill="red")
+
+        # 3. Notification layer (NotifyService): flashing envelope in the
+        # status strip while unread mail exists, banner while undismissed.
+        if self.notify.active() or self._unread_sms > 0:
+            if int(time.time() * 2) % 2 == 0:
+                env = self.get_image("/NeoDCT/System/ui/resources/img/envelope.png")
+                if env:
+                    icon_scale = self.H / 240.0
+                    w = max(1, int(env.width * icon_scale))
+                    h = max(1, int(env.height * icon_scale))
+                    if (w, h) != env.size:
+                        env = env.resize((w, h), Image.Resampling.LANCZOS)
+                    self.canvas.paste(env, (int(46 * icon_scale) + 7,
+                                            int(10 * icon_scale)), env)
+        if self.notify.active():
+            y = max(46, int(self.content_bottom * 0.34))
+            for line in self.notify.banner_lines():
+                self.draw.text((30, y), line, font=self.font_n, fill="white")
+                y += 24
 
     def render_home_dialing(self):
         if self.wallpaper:
@@ -815,6 +842,9 @@ class NeoDCT_UI:
             print(f"[OS] App crashed: {app_name} ({path})")
             traceback.print_exc()
             show_app_crash(self)
+        finally:
+            # Messages may have been read (or arrived) inside the app.
+            self._unread_sms = self._count_unread_sms()
 
     def render_menu(self):
         try:
@@ -835,7 +865,8 @@ class NeoDCT_UI:
     def update(self):
         if self.state == "HOME":
             self.render_home()
-            self.softkey.update("Menu", present=False)
+            self.softkey.update("Read" if self.notify.active() else "Menu",
+                                present=False)
             self.fb.update(self.canvas)
 
         elif self.state == "HOME_DIALING":
@@ -872,6 +903,110 @@ class NeoDCT_UI:
             self.modem.poll()
         except Exception as exc:
             print(f"[MODEM] Poll failed: {exc}")
+            return
+        while True:
+            event = self.modem.take_pending_event()
+            if event is None:
+                break
+            try:
+                if not self._handle_modem_event(event):
+                    break   # port busy: event requeued, retry next tick
+            except Exception as exc:
+                print(f"[MODEM] Event {event[0]} failed: {exc}")
+
+    def _handle_modem_event(self, event):
+        """Turn modem events into inbox rows + notifications.
+
+        Returns False when the AT port was busy (S45modem/atcmd) and the
+        event was pushed back for a later tick."""
+        kind, data = event
+        if kind == "sms_received":
+            status, record = self.modem.fetch_sms(data)
+            if status == "busy":
+                self.modem.requeue_event(event)
+                return False
+            if status == "ok":
+                row_id = self._store_incoming_sms(record["sender"], record["body"])
+                self.notify.post_sms(row_id)
+                self._unread_sms += 1
+        elif kind == "sms_stored_check":
+            status, records = self.modem.read_stored_sms()
+            if status == "busy":
+                self.modem.requeue_event(event)
+                return False
+            for i, record in enumerate(records):
+                row_id = self._store_incoming_sms(record["sender"], record["body"])
+                self.notify.post_sms(row_id, tone=(i == 0))  # one beep, not N
+                self._unread_sms += 1
+        elif kind == "sms_sim":
+            sender, body = data
+            row_id = self._store_incoming_sms(sender, body)
+            self.notify.post_sms(row_id)
+            self._unread_sms += 1
+        # Call events (incoming/connected/ended/...) are left alone until
+        # the incoming-call UI lands.
+        return True
+
+    def _store_incoming_sms(self, sender, body):
+        conn = sqlite3.connect("/NeoDCT/User/db/sms_inbox.db")
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS inbox
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      message TEXT,
+                      sender TEXT,
+                      timestamp INTEGER,
+                      is_read INTEGER DEFAULT 0)''')
+        c.execute("INSERT INTO inbox (message, sender, timestamp, is_read) "
+                  "VALUES (?, ?, ?, 0)", (body, sender, int(time.time())))
+        row_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        print(f"[NOTIFY] SMS stored (id {row_id}) from {sender}")
+        return row_id
+
+    def _play_dtmf(self, char):
+        """Dial-pad beep while typing a number. Pure vibes: VoLTE never
+        hears these, they just sound right."""
+        name = {"*": "star", "#": "hash"}.get(char, char)
+        if name.isdigit() or name in ("star", "hash"):
+            self.notify.play_tone(f"/NeoDCT/System/tones/dtmf/{name}.wav")
+
+    def _count_unread_sms(self):
+        try:
+            conn = sqlite3.connect("/NeoDCT/User/db/sms_inbox.db")
+            n = conn.execute(
+                "SELECT COUNT(*) FROM inbox WHERE is_read = 0").fetchone()[0]
+            conn.close()
+            return n
+        except Exception:
+            return 0
+
+    def _open_notification(self):
+        """Home-screen Read softkey: jump to the new message (or inbox)."""
+        kind = self.notify.kind()
+        count = self.notify.count()
+        target = self.notify.latest_data()
+        self.notify.dismiss()
+        if kind != "sms":
+            return
+        app = next((a for a in self.apps if a.get("name") == "Messages"), None)
+        path = (os.path.join(app["path"], app["exec"]) if app
+                else "/NeoDCT/System/apps/Messages/main.py")
+        try:
+            spec = importlib.util.spec_from_file_location("neodct_app", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if count == 1 and target is not None:
+                module.open_message(self, target)
+            else:
+                module.open_inbox(self)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            print("[NOTIFY] Read flow crashed")
+            traceback.print_exc()
+        finally:
+            self._unread_sms = self._count_unread_sms()
 
     def _shutdown_low_battery(self):
         self._shutting_down = True
@@ -951,7 +1086,18 @@ class NeoDCT_UI:
                 return key
 
     def handle_input(self, code):
-        if code == 28: 
+        # Notification banner owns enter + C on the home screen: Read
+        # opens the message, C clears the banner (mail stays unread and
+        # the envelope keeps flashing). Everything else acts as usual.
+        if self.state == "HOME" and self.notify.active():
+            if code == 28:
+                self._open_notification()
+                return
+            if code == 14:
+                self.notify.dismiss()
+                return
+
+        if code == 28:
             if self.state == "HOME":
                 self.state = "MENU"
             elif self.state == "HOME_DIALING":
@@ -978,6 +1124,7 @@ class NeoDCT_UI:
             char = self.DEV_KEYMAP[code]
             self.dial_buffer += char
             self.state = "HOME_DIALING"
+            self._play_dtmf(char)
 
 def run(fb):
     # First boot with an i2c keypad but no keymap: run the on-screen setup

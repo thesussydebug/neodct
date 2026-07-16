@@ -17,15 +17,22 @@ everyone else skips that transaction and retries on a later tick, so the
 UI never garbles the boot script's registration dance.
 
 SMS sending is live via send_sms() (text-mode AT+CMGS with bespoke
-">"-prompt handling); receiving is deliberately NOT wired yet -- one
-step at a time.
+">"-prompt handling). Receiving is push-based, not polled: AT+CNMI makes
+the modem raise a +CMTI URC the moment a message lands, which becomes an
+("sms_received", index) event; main.py then fetch_sms()es it into the
+inbox DB and NotifyService beeps. read_stored_sms() sweeps messages that
+arrived while the phone was off (queued as ("sms_stored_check", None)
+right after the modem is adopted). Fetched messages are deleted from the
+SIM so its ~30 slots never fill up and silently stop reception.
 
-Real call placement is fenced off while the voice path is under
-construction: unless the system.modem.allow_calls setting is ON, dial()
-and answer() never send ATD/ATA to the hardware -- they run the same
-pretend flow as Simulation Mode (CALLING -> CONNECTED after 2 s) while
-signal/operator/URC tracking stays real. Flip the setting when calls are
-actually ready.
+Calls are LIVE (receive-audio only -- no microphone yet): dial() sends
+ATD, then immediately AT+CPCMREG=1 to route call audio over USB, then
+pipes the modem's PCM port (interface 4, 16 kHz mono S16_LE) straight to
+the speaker with a fire-and-forget `aplay -t raw` subprocess -- zero
+in-process audio code. Call end (VOICE CALL: END / NO CARRIER / hangup)
+kills the pipe and schedules AT+CPCMREG=0. The system.modem.allow_calls
+setting now defaults ON; set it OFF to fall back to the old pretend
+flow (CALLING -> CONNECTED after 2 s, no AT traffic).
 
 If no AT port answers, the service runs in Simulation Mode (boot log says
 so, like BatteryService) and quietly re-probes every PROBE_RETRY_S, so a
@@ -34,10 +41,12 @@ without passthrough:
   echo 23 > /tmp/neodct_sim_csq         # drive the signal bars (0-31, 99)
   echo 5551234 > /tmp/neodct_sim_ring   # fake an incoming call (rm = hangup)
   echo Tello > /tmp/neodct_sim_operator # fake the home-screen carrier line
+  echo '5551234|hey there' > /tmp/neodct_sim_sms   # fake a received SMS
 """
 
 import fcntl
 import os
+import subprocess
 import termios
 import time
 from collections import deque
@@ -46,6 +55,7 @@ LOCK_FILE = "/tmp/neodct-modem.lock"
 SIM_CSQ_FILE = "/tmp/neodct_sim_csq"
 SIM_RING_FILE = "/tmp/neodct_sim_ring"
 SIM_OPS_FILE = "/tmp/neodct_sim_operator"
+SIM_SMS_FILE = "/tmp/neodct_sim_sms"
 
 DEFAULT_PORT = "AUTO"          # AUTO probes ttyUSB2/3 first, then the rest
 BAUD = termios.B115200
@@ -60,6 +70,19 @@ PROBE_RETRY_S = 10.0           # sim mode: how often to look for hardware
 
 # CSQ rssi (0..31, 99=unknown) -> 0..4 bars, roughly -105/-93/-81/-73 dBm.
 BAR_THRESHOLDS = (2, 8, 14, 20)
+
+# Call audio over USB: the SIM7600's PCM port (USB interface 4) streams
+# mono signed-16-bit little-endian once AT+CPCMREG=1 is set. The rate is
+# firmware-configurable via AT+CPCMFRM (0 = 8 kHz factory default,
+# 1 = 16 kHz); we force 16 kHz to match aplay. If your firmware rejects
+# CPCMFRM (logged at dial time), set system.hw.modem_pcm_rate=8000.
+PCM_FORMAT = "S16_LE"
+CLCC_POLL_S = 2.0              # call-progress query cadence during a call
+AUDIO_RESTART_HOLDOFF_S = 3.0  # min gap between aplay restart attempts
+
+# AT+CLCC <stat> values.
+CLCC_STATES = {0: "CONNECTED", 1: "HELD", 2: "CALLING", 3: "RINGING",
+               4: "INCOMING", 5: "WAITING"}
 
 FINAL_CODES = ("OK", "ERROR", "NO CARRIER", "NO DIALTONE", "BUSY", "NO ANSWER")
 
@@ -90,6 +113,14 @@ class ModemService:
         self._next_cops = 0.0
         self._next_probe = 0.0
         self._sim_connect_at = None
+        self._audio_proc = None     # aplay piping the PCM port to ALSA
+        self._pcm_cleanup = False   # send AT+CPCMREG=0 on a later tick
+        self._pcm_retry = False     # re-assert CPCMREG=1 once connected
+        self._call_stat = None      # last AT+CLCC <stat> during a call
+        self._call_connected_at = None
+        self._next_clcc = 0.0
+        self._next_audio_restart = 0.0
+        self._pcm_rate = self._pcm_rate_setting()
         self._configured_port = port or self._port_from_settings()
         self._allow_calls = self._calls_enabled_setting()
 
@@ -112,13 +143,24 @@ class ModemService:
             return DEFAULT_PORT
 
     @staticmethod
-    def _calls_enabled_setting():
+    def _pcm_rate_setting():
         try:
             from System.core.SettingsStorage import get_setting
-            val = str(get_setting("system.modem.allow_calls", "OFF"))
+            return int(str(get_setting("system.hw.modem_pcm_rate", "16000")))
+        except Exception:
+            return 16000
+
+    @staticmethod
+    def _calls_enabled_setting():
+        # Default flipped to ON for the 0.3.0a call bring-up: the USB
+        # audio path exists now. Set system.modem.allow_calls=OFF to get
+        # the old pretend flow back.
+        try:
+            from System.core.SettingsStorage import get_setting
+            val = str(get_setting("system.modem.allow_calls", "ON"))
             return val.strip().upper() in ("ON", "1", "TRUE", "YES")
         except Exception:
-            return False   # fail safe: never place real calls by accident
+            return True
 
     def _candidate_ports(self):
         if self._configured_port and self._configured_port != "AUTO":
@@ -201,12 +243,16 @@ class ModemService:
         self._transact("AT+CLIP=1")     # caller ID URCs
         self._transact("AT+CVHU=0")     # make hangup commands actually hang up
         self._transact("AT+COPS=3,1")   # short operator names ("T-Mobile", "Tello")
+        self._transact("AT+CMGF=1")     # text-mode SMS everywhere
+        self._transact("AT+CNMI=2,1,0,0,0")  # push +CMTI URC on new SMS
         final, lines = self._transact("AT+CGSN", timeout=2.0)
         if final == "OK":
             digits = [ln for ln in lines if ln.strip().isdigit()]
             self.imei = digits[0].strip() if digits else None
         print("[MODEM] SIM7600 on %s (IMEI %s). Using REAL modem."
               % (self.port, self.imei or "unknown"))
+        # Catch messages that arrived while the phone was off.
+        self._events.append(("sms_stored_check", None))
         if not self._allow_calls:
             print("[MODEM] Real call placement DISABLED "
                   "(system.modem.allow_calls=OFF); dial/answer will simulate.")
@@ -313,6 +359,10 @@ class ModemService:
     # --- URC handling ----------------------------------------------------
 
     def _handle_urc(self, line):
+        # Call-flow URCs go to the console: bring-up needs eyes.
+        if line.startswith(("RING", "VOICE CALL:", "NO CARRIER",
+                            "MISSED_CALL", "+CLIP:", "BUSY", "NO ANSWER")):
+            print(f"[MODEM] {line}")
         if line == "RING":
             if self.state != "RINGING":
                 self.state = "RINGING"
@@ -328,16 +378,28 @@ class ModemService:
                 self._events.append(("incoming", number))
         elif line.startswith("VOICE CALL: BEGIN"):
             self.state = "CONNECTED"
+            if self._call_connected_at is None:
+                self._call_connected_at = time.monotonic()
+            # Some firmwares only accept CPCMREG=1 with a call up;
+            # re-assert on the next free tick now that we're connected.
+            self._pcm_retry = True
             self._events.append(("connected", self.caller_id))
         elif line.startswith("VOICE CALL: END") or line == "NO CARRIER":
             if self.state != "IDLE":
                 self.state = "IDLE"
+                self._stop_call_audio()
                 self._events.append(("ended", line))
         elif line.startswith("MISSED_CALL:"):
             self.state = "IDLE"
+            self._stop_call_audio()
             self._events.append(("missed", line.split(":", 1)[1].strip()))
         elif line.startswith("+CMTI:"):
-            self._events.append(("sms", line))
+            # +CMTI: "SM",3 -> a new message landed in slot 3
+            try:
+                index = int(line.rsplit(",", 1)[1])
+            except (IndexError, ValueError):
+                return
+            self._events.append(("sms_received", index))
         elif line.startswith(("+CEREG:", "+CREG:")):
             self._parse_reg(line)
 
@@ -361,6 +423,8 @@ class ModemService:
                 and now >= self._sim_connect_at:
             self._sim_connect_at = None
             self.state = "CONNECTED"
+            if self._call_connected_at is None:
+                self._call_connected_at = time.monotonic()
             self._events.append(("connected", None))
 
         if not self.hardware:
@@ -376,6 +440,22 @@ class ModemService:
         try:
             for line in self._read_pending():
                 self._handle_urc(line)
+            # Deferred CPCMREG=0 (call teardown happened inside a URC
+            # handler where the lock was already held).
+            if self._pcm_cleanup:
+                self._pcm_cleanup = False
+                self._transact("AT+CPCMREG=0", timeout=2.0)
+            # In-call monitoring: CPCMREG retry, call progress via CLCC,
+            # and an aplay watchdog -- bring-up eyes for the console.
+            if self.state != "IDLE":
+                if self._pcm_retry:
+                    self._pcm_retry = False
+                    final, _ = self._transact("AT+CPCMREG=1", timeout=3.0)
+                    print(f"[MODEM] CPCMREG=1 (in-call retry) -> {final}")
+                if now >= self._next_clcc:
+                    self._next_clcc = now + CLCC_POLL_S
+                    self._poll_clcc()
+                self._watch_audio_proc(now)
             # Stagger the queries so one tick never fires more than one.
             if now >= self._next_csq:
                 self._next_csq = now + POLL_SIGNAL_S
@@ -392,6 +472,67 @@ class ModemService:
                     self._parse_cops(lines)
         finally:
             self._release()
+
+    def _poll_clcc(self):
+        """AT+CLCC call-progress check. Caller holds the lock.
+
+        Logs DIALING -> RINGING -> CONNECTED transitions, timestamps the
+        connect, and -- crucially for stuck calls -- notices when the
+        call list is empty even though we still think a call is up
+        (missed VOICE CALL: END), ending the call state cleanly.
+        """
+        final, lines = self._transact("AT+CLCC", timeout=2.0)
+        if final != "OK":
+            return
+        stat = None
+        for line in lines:
+            if line.startswith("+CLCC:"):
+                try:
+                    stat = int(line.split(":", 1)[1].split(",")[2])
+                except (IndexError, ValueError):
+                    continue
+                break
+        if stat is None:
+            if self.state != "IDLE":
+                print("[MODEM] CLCC: no call in the list; ending call state.")
+                self.state = "IDLE"
+                self._stop_call_audio()
+                self._events.append(("ended", "CLCC empty"))
+            return
+        if stat != self._call_stat:
+            self._call_stat = stat
+            print(f"[MODEM] Call progress: {CLCC_STATES.get(stat, stat)}")
+        if stat == 0:
+            if self._call_connected_at is None:
+                self._call_connected_at = time.monotonic()
+            self.state = "CONNECTED"
+
+    def _watch_audio_proc(self, now):
+        """Restart aplay if it died mid-call (device busy, bad open...)."""
+        if self._audio_proc is None or self._audio_proc.poll() is None:
+            return
+        if now < self._next_audio_restart:
+            return
+        self._next_audio_restart = now + AUDIO_RESTART_HOLDOFF_S
+        print(f"[MODEM] aplay exited rc={self._audio_proc.returncode} "
+              "mid-call; restarting the audio pipe.")
+        self._audio_proc = None
+        self._start_call_audio()
+
+    def call_status(self):
+        """(label, connected_seconds|None) for the in-call screen."""
+        if self.state == "IDLE":
+            return "IDLE", None
+        if self._call_stat == 3:
+            return "RINGING", None
+        if self._call_stat == 2:
+            return "CALLING", None
+        if self.state == "CONNECTED" or self._call_stat == 0:
+            secs = None
+            if self._call_connected_at is not None:
+                secs = int(time.monotonic() - self._call_connected_at)
+            return "CONNECTED", secs
+        return self.state, None
 
     def _parse_csq(self, lines):
         for line in lines:
@@ -421,11 +562,95 @@ class ModemService:
             self.state = "IDLE"
             self._events.append(("ended", "sim caller gave up"))
 
+        # Fake received SMS driven by /tmp/neodct_sim_sms ("number|text").
+        if self._exists(SIM_SMS_FILE):
+            content = ""
+            try:
+                with open(SIM_SMS_FILE) as f:
+                    content = f.read().strip()
+                os.remove(SIM_SMS_FILE)
+            except Exception:
+                pass
+            if content:
+                sender, _, body = content.partition("|")
+                if not body:
+                    sender, body = "5550000", sender
+                self._events.append(("sms_sim", (sender.strip(), body.strip())))
+
         # Re-probe for late/hotplugged hardware (e.g. modem enumerated
         # after the UI started, or QEMU passthrough attached on the fly).
         if now >= self._next_probe:
             if self._probe_hardware():
                 self._events.append(("modem_found", self.port))
+
+    # --- call audio over USB -------------------------------------------------
+
+    def _pcm_port(self):
+        """The modem's PCM audio port: USB interface 4 on the SIM7600."""
+        try:
+            from System.core.SettingsStorage import get_setting
+            configured = str(get_setting("system.hw.modem_pcm_port", "AUTO"))
+        except Exception:
+            configured = "AUTO"
+        if configured != "AUTO":
+            return configured
+        for name in sorted(os.listdir("/sys/class/tty") if os.path.isdir("/sys/class/tty") else []):
+            if not name.startswith("ttyUSB"):
+                continue
+            try:
+                with open("/sys/class/tty/%s/device/../bInterfaceNumber" % name) as f:
+                    if int(f.read().strip(), 16) == 4:
+                        return "/dev/" + name
+            except Exception:
+                continue
+        return "/dev/ttyUSB4"
+
+    def _start_call_audio(self):
+        """Pipe the PCM port to the speaker: aplay reads the raw stream.
+
+        Receive-only by design (no microphone hardware yet). Fire and
+        forget -- if aplay or the port is missing the call is silent but
+        everything else keeps working.
+        """
+        if self._audio_proc is not None:
+            return
+        port = self._pcm_port()
+        if not self._exists(port):
+            print(f"[MODEM] PCM port {port} not found; call audio unavailable.")
+            return
+        try:
+            fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            attrs = termios.tcgetattr(fd)
+            attrs[0] = attrs[1] = attrs[3] = 0   # fully raw: PCM is not text
+            attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            os.close(fd)
+            self._audio_proc = subprocess.Popen(
+                ["aplay", "-q", "-t", "raw", "-f", PCM_FORMAT,
+                 "-r", str(self._pcm_rate), "-c", "1", port],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[MODEM] Call audio: aplay <- {port} "
+                  f"({self._pcm_rate} Hz {PCM_FORMAT}).")
+        except Exception as exc:
+            self._audio_proc = None
+            print(f"[MODEM] Call audio unavailable: {exc}")
+
+    def _stop_call_audio(self):
+        """Kill the audio pipe; CPCMREG=0 goes out on the next free tick."""
+        if self._audio_proc is not None:
+            try:
+                self._audio_proc.kill()
+                self._audio_proc.wait(timeout=1)
+            except Exception:
+                pass
+            self._audio_proc = None
+            print("[MODEM] Call audio stopped.")
+        self._call_stat = None
+        self._call_connected_at = None
+        if self.hardware:
+            self._pcm_cleanup = True
 
     # --- call control ------------------------------------------------------
 
@@ -443,6 +668,20 @@ class ModemService:
         final, _ = self._command(f"ATD{number};", timeout=8.0)
         if final == "OK":
             self.state = "CALLING"
+            self._call_stat = None
+            self._call_connected_at = None
+            self._next_clcc = 0.0
+            # Route audio over USB immediately so ringback/early media
+            # is audible while the far end is still ringing. CPCMFRM
+            # picks the stream rate (1 = 16 kHz; factory default is 8k).
+            frm = "1" if self._pcm_rate == 16000 else "0"
+            final_frm, _ = self._command("AT+CPCMFRM=%s" % frm, timeout=2.0)
+            final_reg, _ = self._command("AT+CPCMREG=1", timeout=3.0)
+            print(f"[MODEM] USB audio setup: CPCMFRM={frm} -> {final_frm}, "
+                  f"CPCMREG=1 -> {final_reg}")
+            if final_reg != "OK":
+                self._pcm_retry = True   # try again once connected
+            self._start_call_audio()
             return True
         print(f"[MODEM] Dial failed (final={final})")
         return False
@@ -454,12 +693,15 @@ class ModemService:
         final, _ = self._command("ATA", timeout=8.0)
         if final == "OK":
             self.state = "CONNECTED"
+            self._command("AT+CPCMREG=1", timeout=3.0)
+            self._start_call_audio()
             return True
         return False
 
     def hangup(self):
         print("[MODEM] Requesting Hangup")
         self._sim_connect_at = None
+        self._stop_call_audio()
         if not self.hardware:
             self.state = "IDLE"
             return True
@@ -536,6 +778,85 @@ class ModemService:
                         self._handle_urc(line)
                 time.sleep(0.05)
             return False, "timeout waiting for network"
+        finally:
+            self._release()
+
+    @staticmethod
+    def _parse_sms_records(lines, header):
+        """Parse +CMGR:/+CMGL: reply lines into [{index, sender, body}]."""
+        records = []
+        current = None
+        for line in lines:
+            if line.startswith(header):
+                if current is not None:
+                    records.append(current)
+                quoted = line.split('"')[1::2]
+                sender = quoted[1] if len(quoted) > 1 else "unknown"
+                index = None
+                if header == "+CMGL:":
+                    try:
+                        index = int(line.split(":", 1)[1].split(",")[0])
+                    except (IndexError, ValueError):
+                        pass
+                current = {"index": index, "sender": sender, "body": []}
+            elif current is not None:
+                current["body"].append(line)
+        if current is not None:
+            records.append(current)
+        for rec in records:
+            rec["body"] = "\n".join(rec["body"]).strip()
+        return records
+
+    def fetch_sms(self, index):
+        """Read the +CMTI-announced message, then delete it from the SIM.
+
+        Returns (status, record): status "ok" (record dict), "busy" (port
+        locked -- caller should retry later), or "error" (give up).
+        """
+        if not self.hardware:
+            return "error", None
+        if not self._acquire():
+            return "busy", None
+        try:
+            self._transact("AT+CMGF=1")
+            final, lines = self._transact("AT+CMGR=%d" % index, timeout=5.0)
+            if final != "OK":
+                print(f"[MODEM] CMGR {index} failed ({final})")
+                return "error", None
+            records = self._parse_sms_records(lines, "+CMGR:")
+            if not records:
+                return "error", None
+            self._transact("AT+CMGD=%d" % index, timeout=5.0)
+            record = records[0]
+            record["index"] = index
+            print(f"[MODEM] SMS received from {record['sender']} "
+                  f"({len(record['body'])} chars)")
+            return "ok", record
+        finally:
+            self._release()
+
+    def read_stored_sms(self):
+        """Sweep unread messages waiting on the SIM (arrived while off).
+
+        Returns (status, records) like fetch_sms; each fetched message is
+        deleted from the SIM afterward.
+        """
+        if not self.hardware:
+            return "error", []
+        if not self._acquire():
+            return "busy", []
+        try:
+            self._transact("AT+CMGF=1")
+            final, lines = self._transact('AT+CMGL="REC UNREAD"', timeout=8.0)
+            if final != "OK":
+                return "error", []
+            records = self._parse_sms_records(lines, "+CMGL:")
+            for rec in records:
+                if rec["index"] is not None:
+                    self._transact("AT+CMGD=%d" % rec["index"], timeout=5.0)
+            if records:
+                print(f"[MODEM] Imported {len(records)} stored SMS from the SIM.")
+            return "ok", records
         finally:
             self._release()
 
@@ -617,6 +938,10 @@ class ModemService:
         """Pop the oldest latched event tuple (kind, detail), or None."""
         return self._events.popleft() if self._events else None
 
+    def requeue_event(self, event):
+        """Push an event back to the front (port was busy; retry later)."""
+        self._events.appendleft(event)
+
     def status_snapshot(self):
         """One-look state dump for logs and the future Modem engineering app."""
         return {
@@ -637,6 +962,7 @@ class ModemService:
         return self._command(cmd, timeout=timeout)
 
     def close(self):
+        self._stop_call_audio()
         if self.fd is not None:
             try:
                 os.close(self.fd)
