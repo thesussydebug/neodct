@@ -23,7 +23,7 @@ Port map at the stock PID `1e0e:9001`:
 | `/dev/ttyUSB1` | 1 | GPS NMEA stream |
 | `/dev/ttyUSB2` | 2 | **AT commands** ← everything here uses this |
 | `/dev/ttyUSB3` | 3 | AT / PPP modem port (spare) |
-| `/dev/ttyUSB4` | 4 | audio/PCM |
+| `/dev/ttyUSB4` | 4 | **call audio PCM** (16 kHz mono S16_LE after `AT+CPCMREG=1`) |
 
 ## QEMU passthrough recap
 
@@ -119,14 +119,17 @@ probe-or-simulate pattern as BatteryService):
   real operator name ("Tello" / "T-Mobile", short-format `AT+COPS=3,1`)
   once registered; it falls back to "No Service" whenever registration
   drops.
-* **Call control (SAFETY-GATED)**: real `ATD<number>;` / `ATA` are only
-  sent when the `system.modem.allow_calls` setting is ON — it defaults
-  OFF while the voice path isn't ready, so pressing Call just pretends
-  (2 s fake connect) even with a live registered modem. `hangup()` always
-  sends `AT+CHUP` on hardware (harmless idle, and it rejects a real
-  incoming RING). URCs (`RING`, `+CLIP`, `VOICE CALL: BEGIN/END`,
-  `NO CARRIER`) update `modem.state` and queue events
-  (`take_pending_event()`) for the incoming-call UI to come.
+* **Calls are LIVE (receive-audio only)**: `system.modem.allow_calls`
+  now defaults ON (OFF restores the pretend flow). `dial()` sends `ATD`,
+  then immediately `AT+CPCMREG=1`, then pipes the PCM port to the
+  speaker with `aplay -q -t raw -f S16_LE -r 16000 -c 1 /dev/ttyUSBn` —
+  pure BusyBox plumbing. No microphone yet, so the far end hears
+  silence. Teardown (End key, `NO CARRIER`, `VOICE CALL: END`) kills the
+  pipe and sends `AT+CPCMREG=0`; the call screen exits by itself on
+  remote hangup. Typing a number plays fake DTMF beeps
+  (`System/tones/dtmf/`). Test line: 1-800-444-4444 (MCI readback).
+  Bench note: LTE TX during a call is the worst case for the missing
+  capacitor — if the modem vanishes mid-call, that's the brownout.
 * **Coexistence**: every port transaction takes the advisory lock
   `/tmp/neodct-modem.lock`, shared with `atcmd` and `S45modem` — you can
   poke AT commands from the serial console while the UI runs.
@@ -138,7 +141,23 @@ probe-or-simulate pattern as BatteryService):
   Message → Options → Send prompts for a number (arrow keys open the
   PhoneBook contact picker) and sends via `ModemService.send_sms()` —
   text-mode `AT+CMGS` with special handling for the newline-less `>`
-  prompt. Receiving is deliberately not wired yet.
+  prompt.
+* **SMS receiving is LIVE, 3310-style** (NotifyService): `AT+CNMI`
+  pushes `+CMTI` the instant a message lands → fetched with `AT+CMGR`,
+  deleted from the SIM, stored in the inbox DB. The original Nokia tone
+  beeps immediately; the home screen shows "N message(s) received" with
+  the **Read** softkey (C dismisses) and a flashing envelope while
+  unread mail exists. A boot sweep (`AT+CMGL="REC UNREAD"`) imports
+  messages that arrived while the phone was off. QEMU sim hook:
+  `echo '5551234|hey' > /tmp/neodct_sim_sms`.
+* **Incoming calls ring and interrupt apps**: `RING`/`+CLIP` →
+  `IncomingCall` (a `BaseException`, like `KeyboardInterrupt`) raised
+  from `read_keypress` unwinds whatever app is running (their `finally`
+  blocks release ALSA), then the 3310-style screen shows the caller with
+  a flashing "calling", **Answer** softkey and **C** to decline. The
+  ringtone is `system.audio.ringtone`, looped in-process via miniaudio.
+  QEMU sim hook: `echo 16165551234 > /tmp/neodct_sim_ring` rings once
+  per write/touch; `rm` it to make the caller give up.
 * **Modem engineering app** (menu id 9005): RADIO / SIM / DATA status
   pages, softkey walks Next→Next→Exit. Shows operator, CEREG, CSQ+dBm,
   CPIN, phone number, IMEI, ICCID, IMSI, firmware, S45modem status, wwan

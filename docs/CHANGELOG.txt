@@ -48,6 +48,87 @@ Modem (SIM7600G bring-up -- MODEM SUPPORT!)
   nodes exist instead, so "why is there no modem" is debuggable on-screen
   without a serial console.
 
+Calls -- INCOMING (the phone rings!)
+- The phone now rings on incoming calls and interrupts whatever app is
+  running, like the real 3310 (it didn't multitask either; a nicer
+  suspend/resume is post-alpha work). Mechanism: ModemService's RING/
+  +CLIP URCs are seen by read_keypress -- the chokepoint every screen
+  funnels through -- which raises IncomingCall. It derives from
+  BaseException on purpose (exactly like KeyboardInterrupt) so an app's
+  own `except Exception` can't swallow a ringing phone, and unwinding
+  runs the apps' finally blocks: MusicPlayer/Koki release the ALSA
+  device before the ringtone starts.
+- New incoming-call screen (System/ui/Dialer/incoming_screen.py) built
+  to the 3310 photo: caller name (phonebook lookup by last-10-digits, so
+  a stored "555-1234" matches a "+1555..." caller ID) or number across
+  the top, auto-shrunk so a full USA number never runs off screen;
+  flashing "calling" near the bottom left; softkey says Answer and C
+  declines. A late +CLIP updates the name live instead of leaving
+  "Unknown". Caller hangs up first -> the screen exits by itself.
+- Answer -> AT+ATA -> the existing in-call screen with USB call audio;
+  decline/hangup -> AT+CHUP. The ringer always stops before call audio
+  claims the ALSA device.
+- NotifyService grew the ringer: the user's ringtone
+  (system.audio.ringtone) is decoded once and looped in-process with
+  python-miniaudio (same reasoning as MusicPlayer: no ~24MB mpv
+  process), mpv only as fallback. Paths with spaces are handled
+  natively -- the path never touches a shell.
+- Ringtone resolution never rings silently: a missing file falls back to
+  the same basename with another extension (so the .wma -> .mp3
+  re-encode keeps working), then Nokia Tune/Ring Ring, then any playable
+  tone, each logged. NOTE: settings.prop currently points at "Brave
+  Scottland.mp3" but the file is "Brave Scotland.mp3" (one t), so it
+  rings the fallback until the typo is fixed.
+- SettingsStorage default ringtone updated .wma -> .mp3 (the shipped
+  tones were re-encoded).
+- Sim hook fixed: /tmp/neodct_sim_ring now rings once per write/touch
+  (mtime-tracked) instead of instantly re-ringing after a decline, which
+  made declining impossible to test; `rm` while ringing still means the
+  caller gave up.
+- Verified against the real main.py code paths: IncomingCall dodging an
+  app's `except Exception` while its finally still runs, _ring_tick
+  grace period for +CLIP (and withheld numbers), the answer/decline/gone
+  flows with ring-stop ordering, ringtone resolution (typo'd path, space
+  in name, .wma->.mp3, empty setting), the loop generator's seamless
+  wrap, and the sim ring hook.
+
+Calls (REAL VOICE CALLS -- receive audio only for now)
+- Dialing is live: system.modem.allow_calls now defaults ON (set OFF for
+  the old pretend flow). dial() sends ATD, then immediately AT+CPCMREG=1
+  to route call audio over USB, then pipes the modem's PCM port (USB
+  interface 4, auto-detected like the AT port; 16 kHz mono S16_LE) to
+  the speaker via `aplay -t raw` -- pure BusyBox plumbing, no in-process
+  audio code, kilobytes of overhead. Receive-only by design: there is no
+  microphone hardware yet, so the far end hears silence. If the network
+  sends early media you hear real ringback while it rings (local fake
+  ringback is a future fallback).
+- Call teardown from every direction kills the audio pipe and schedules
+  AT+CPCMREG=0: End key (AT+CHUP), remote hangup (NO CARRIER /
+  VOICE CALL: END), missed. The in-call screen now shows "Calling..."
+  until connected and exits on its own when the far end hangs up
+  (previously it sat there until you pressed End).
+- Fake DTMF dial beeps while typing a number on the home screen: twelve
+  proper dual-tone wavs (0-9 * #, 697-1477 Hz pairs, 120 ms, click-free
+  ramps) generated into System/tones/dtmf/. VoLTE never hears them --
+  they just sound right.
+- Verified against the pty fake modem: ATD -> CPCMREG=1 ordering, remote
+  -end teardown with deferred CPCMREG=0, hangup path, allow_calls=OFF
+  pretend flow, and wav format checks. First live test target:
+  1-800-444-4444 (MCI's readback line).
+- Call monitoring after the first live test showed calls connecting but
+  no way to see what the audio path did: the console now logs every
+  call URC, the CPCMFRM/CPCMREG results at dial time (CPCMREG=1 is
+  re-asserted after connect for firmwares that reject it early), and
+  AT+CLCC is polled every 2 s during a call -- Call progress:
+  CALLING -> RINGING -> CONNECTED transitions in the log, "Ringing..."
+  on the call screen, and a running mm:ss timer once connected. An
+  empty CLCC list while a call is supposedly up ends the call state
+  (recovers missed VOICE CALL: END). An aplay watchdog logs the exit
+  code and restarts the pipe if it dies mid-call. AT+CPCMFRM now
+  explicitly selects 16 kHz (factory default is 8 kHz on many builds --
+  a prime silent-audio suspect); system.hw.modem_pcm_rate=8000 flips
+  both the modem and aplay if a firmware insists on 8 k.
+
 Messages (SMS sending -- FIRST LIVE TELEPHONY!)
 - The Messages app really sends SMS now: Write Message -> Options ->
   Send prompts a "Number" TextInput, then hands off to the modem and
@@ -64,9 +145,29 @@ Messages (SMS sending -- FIRST LIVE TELEPHONY!)
   end-to-end against a pty-based fake modem speaking the real CMGS
   dance, plus rejection/validation paths. Simulation Mode pretends
   honestly ("simulated").
-- Receiving is deliberately not wired yet -- one step at a time.
 - Guardrails: empty drafts and >160-char messages are stopped in the app
   with a clear dialog before the modem is ever touched.
+- RECEIVING is live too, 3310-style (new NotifyService,
+  System/core/NotifyService): a new SMS beeps the original Nokia tone
+  immediately (System/tones/sms.wav, aplay fire-and-forget; invisible to
+  the ringtone list which only scans mp3/wma) and puts an "N message(s)
+  received" banner on the HOME screen -- carrier line steps aside,
+  softkey becomes Read (straight into the message, or the Inbox when
+  several arrived), C dismisses. A flashing envelope sits in the status
+  strip while unread mail exists. Nothing pops over running apps (by
+  design, like battery warnings); battery keeps its own framework.
+- Push, not polled: AT+CNMI raises +CMTI the instant a message lands ->
+  ModemService.fetch_sms (AT+CMGR) -> existing sms_inbox.db -> notify.
+  A boot sweep (AT+CMGL="REC UNREAD") imports messages that arrived
+  while the phone was off. Fetched messages are deleted from the SIM so
+  its ~30 slots can't fill up and silently kill reception. If the AT
+  port is busy (S45modem still registering) the event politely requeues.
+- Opening a message finally marks it read (is_read was never updated
+  before -- inbox stars never cleared). Sim hook for QEMU:
+  echo '5551234|hey' > /tmp/neodct_sim_sms.
+- Verified against the pty fake modem: CMGL boot sweep (multi-line
+  bodies), CMTI->CMGR->CMGD flow, busy requeue, sim hook, banner
+  pluralization/dismiss.
 
 MusicPlayer
 - Playback engine swapped from spawned mpv processes to in-process

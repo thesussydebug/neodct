@@ -2,7 +2,7 @@ import os
 
 SETTINGS_PATH = "/NeoDCT/User/settings.prop"
 DEFAULTS = {
-    "system.audio.ringtone": "/NeoDCT/System/tones/Entertainer.wma",
+    "system.audio.ringtone": "/NeoDCT/System/tones/Entertainer.mp3",
     "system.ui.wallpaper": "NONE",
     "system.ui.engineering_mode": "ON",
     "system.os.versionnumber": "0.2.4a",

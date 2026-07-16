@@ -23,6 +23,7 @@ from System.core.BatteryService import BatteryService
 from System.core.NotifyService import NotifyService
 from System.core.CrashHandler import show_app_crash
 import System.ui.Dialer.call_screen as dialer_ui
+import System.ui.Dialer.incoming_screen as incoming_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
 from System.core.ErrorScreen import show_alpha_security_notice_once, show_error
 
@@ -487,6 +488,21 @@ def init_databases():
 
         print("[CORE] Databases initialized successfully.")
 
+class IncomingCall(BaseException):
+    """Raised out of read_keypress when the modem reports a RING.
+
+    Derives from BaseException on purpose, exactly like KeyboardInterrupt:
+    apps catch `Exception` around their own loops, and a ringing phone
+    must not be swallowed by a game's error handling. Unwinding runs the
+    apps' finally blocks, so MusicPlayer/Koki release the ALSA device
+    before the ringtone starts. The 3310 didn't multitask either.
+    """
+
+    def __init__(self, number=None):
+        super().__init__(number)
+        self.number = number
+
+
 # --- UI LOGIC ---
 class NeoDCT_UI:
     def __init__(self, fb_driver):
@@ -496,6 +512,8 @@ class NeoDCT_UI:
         self.battery = BatteryService()
         self.notify = NotifyService()
         self._unread_sms = self._count_unread_sms()
+        self._handling_call = False   # guards the ring UI from re-raising
+        self._ring_seen_at = None
         self._shutting_down = False
         self.dial_buffer = ""
         
@@ -835,7 +853,9 @@ class NeoDCT_UI:
                 module.run(self)
             else:
                 print(f"[OS] App has no run(ui): {path}")
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, IncomingCall):
+            # A ringing phone is not an app crash: let it unwind to the
+            # core loop (the app's own finally blocks already ran).
             raise
         except BaseException:
             app_name = app.get("name", "(unknown)")
@@ -853,7 +873,7 @@ class NeoDCT_UI:
             if choice != -1:
                 print(f"[OS] Launching App ID: {choice}")
                 self.launch_app(self.apps[choice])
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, IncomingCall):
             raise
         except BaseException:
             print("[OS] Menu crashed")
@@ -964,6 +984,65 @@ class NeoDCT_UI:
         print(f"[NOTIFY] SMS stored (id {row_id}) from {sender}")
         return row_id
 
+    def _ring_tick(self):
+        """Interrupt whatever is running when the phone rings.
+
+        Called from read_keypress, so it fires on every screen: the home
+        loop, menus, modal dialogs and apps all funnel through here.
+        """
+        if self._handling_call:
+            return   # already showing the ring/call UI
+        if self.modem.state != "RINGING":
+            self._ring_seen_at = None
+            return
+        if self._ring_seen_at is None:
+            self._ring_seen_at = time.monotonic()
+        # +CLIP lands a beat after RING; give it one poll cycle so the
+        # screen opens with the caller's name instead of "Unknown".
+        if self.modem.caller_id is None \
+                and (time.monotonic() - self._ring_seen_at) < 0.6:
+            return
+        raise IncomingCall(self.modem.caller_id)
+
+    def handle_incoming_call(self, number):
+        """Ring, then answer/decline. Owns the ringer and the call UI."""
+        self._handling_call = True
+        self.state = "HOME"
+        name = None
+        try:
+            print(f"[CORE] Incoming call from {number or 'unknown'}")
+            self.notify.start_ring()
+            result = incoming_ui.show_incoming(self, number)
+            self.notify.stop_ring()
+
+            if result == "answered":
+                if self.modem.answer():
+                    dialer_ui.show_calling(self, number or "", name)
+                    # show_calling returns on End or remote hangup; make
+                    # sure the line is really down either way.
+                    self.modem.hangup()
+                else:
+                    print("[CORE] Answer failed; releasing the call.")
+                    self.modem.hangup()
+            elif result == "declined":
+                print("[CORE] Call declined.")
+                self.modem.hangup()
+            else:
+                print("[CORE] Caller hung up before we answered.")
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            print("[CORE] Incoming call flow crashed")
+            traceback.print_exc()
+            try:
+                self.modem.hangup()
+            except Exception:
+                pass
+        finally:
+            self.notify.stop_ring()
+            self._handling_call = False
+            self.state = "HOME"
+
     def _play_dtmf(self, char):
         """Dial-pad beep while typing a number. Pure vibes: VoLTE never
         hears these, they just sound right."""
@@ -1044,6 +1123,7 @@ class NeoDCT_UI:
     def read_keypress(self, timeout=0.1):
         self._battery_tick()
         self._modem_tick()
+        self._ring_tick()
 
         # Primary path: GPIO matrix keymap (if present and initialized).
         # Backward-compatible fallback: still read evdev keyboard events.
@@ -1147,6 +1227,8 @@ def run(fb):
             if key is not None:
                 print(f"[INPUT] Code: {key}")
                 ui.handle_input(key)
+        except IncomingCall as call:
+            ui.handle_incoming_call(call.number)
         except KeyboardInterrupt:
             raise
         except BaseException:

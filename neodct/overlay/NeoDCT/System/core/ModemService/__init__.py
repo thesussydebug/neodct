@@ -120,6 +120,7 @@ class ModemService:
         self._call_connected_at = None
         self._next_clcc = 0.0
         self._next_audio_restart = 0.0
+        self._sim_ring_mtime = None
         self._pcm_rate = self._pcm_rate_setting()
         self._configured_port = port or self._port_from_settings()
         self._allow_calls = self._calls_enabled_setting()
@@ -548,9 +549,16 @@ class ModemService:
                 self.operator = line.split('"')[1] if '"' in line else None
 
     def _poll_sim(self, now):
-        # Fake incoming call driven by /tmp/neodct_sim_ring.
+        # Fake incoming call driven by /tmp/neodct_sim_ring. One ring per
+        # write/touch (mtime-tracked), so answering or declining doesn't
+        # instantly re-ring; `rm` while it rings = the caller gave up.
         if self._exists(SIM_RING_FILE):
-            if self.state == "IDLE":
+            try:
+                mtime = os.path.getmtime(SIM_RING_FILE)
+            except OSError:
+                mtime = None
+            if self.state == "IDLE" and mtime != self._sim_ring_mtime:
+                self._sim_ring_mtime = mtime
                 try:
                     with open(SIM_RING_FILE) as f:
                         self.caller_id = f.read().strip() or "5550000"
@@ -558,9 +566,11 @@ class ModemService:
                     self.caller_id = "5550000"
                 self.state = "RINGING"
                 self._events.append(("incoming", self.caller_id))
-        elif self.state == "RINGING":
-            self.state = "IDLE"
-            self._events.append(("ended", "sim caller gave up"))
+        else:
+            self._sim_ring_mtime = None
+            if self.state == "RINGING":
+                self.state = "IDLE"
+                self._events.append(("ended", "sim caller gave up"))
 
         # Fake received SMS driven by /tmp/neodct_sim_sms ("number|text").
         if self._exists(SIM_SMS_FILE):
