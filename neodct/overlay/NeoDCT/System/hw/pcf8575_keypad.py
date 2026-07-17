@@ -14,7 +14,7 @@ means the key at (that row, that column) is pressed.
 
 Standalone test (prints raw scan hits, no NeoDCT UI needed):
   python3 -m System.hw.pcf8575_keypad            # from /NeoDCT
-  python3 pcf8575_keypad.py --bus 1 --addr 0x20  # directly
+  python3 pcf8575_keypad.py --bus 3 --addr 0x20  # directly
 """
 
 # I love Claude! I don't think I would've ever figured this out without Claude Fable. LMAO.
@@ -26,7 +26,7 @@ import time
 
 I2C_SLAVE = 0x0703  # linux/i2c-dev.h
 
-DEFAULT_BUS = 1
+DEFAULT_BUS = 3
 DEFAULT_ADDR = 0x20
 DEFAULT_ROW_PINS = [0, 1, 2, 3]   # expander pins P00-P03
 DEFAULT_COL_PINS = [4, 5, 6, 7]   # expander pins P04-P07

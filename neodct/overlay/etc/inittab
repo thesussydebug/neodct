@@ -18,6 +18,7 @@ tty1::once:/bin/run_neodct.sh
 # It's safe to list both; init will just fail one silently if it doesn't exist.
 # ttyAMA0::respawn:/sbin/getty -L ttyAMA0 115200 vt100
 ttyFIQ0::respawn:/sbin/getty -L ttyFIQ0 115200 vt100
+ttyAMA0::respawn:/sbin/getty -L ttyAMA0 115200 vt100
 
 
 # 4. System Hooks

@@ -108,6 +108,43 @@ def _fetch_outbox_messages():
     conn.close()
     return data
 
+def _mark_read(message_id):
+    if not os.path.exists(INBOX_DB) or message_id is None:
+        return
+    conn = sqlite3.connect(INBOX_DB)
+    conn.execute("UPDATE inbox SET is_read = 1 WHERE id = ?", (message_id,))
+    conn.commit()
+    conn.close()
+
+
+def _fetch_inbox_message(message_id):
+    if not os.path.exists(INBOX_DB):
+        return None
+    conn = sqlite3.connect(INBOX_DB)
+    c = conn.cursor()
+    c.execute("SELECT id, message, sender, timestamp, is_read FROM inbox WHERE id = ?",
+              (message_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def open_message(ui, message_id):
+    """Jump straight into one message (the home screen's Read softkey)."""
+    row = _fetch_inbox_message(message_id)
+    if row is None:
+        return _show_inbox(ui, ROOT_ID_MESSAGES, 1)
+    msg_id, message, sender, timestamp, _ = row
+    _mark_read(msg_id)
+    _show_message_detail(ui, "Inbox", f"{ROOT_ID_MESSAGES}-1", 1, message,
+                         message_id=msg_id, sender=sender, timestamp=timestamp)
+
+
+def open_inbox(ui):
+    """Open the inbox list (Read softkey with several new messages)."""
+    _show_inbox(ui, ROOT_ID_MESSAGES, 1)
+
+
 def _delete_inbox_message(message_id):
     if not os.path.exists(INBOX_DB):
         return
@@ -325,6 +362,7 @@ def _show_inbox(ui, root_id, sub_index):
         if selection_index == -1:
             return
         message_id, message, sender, timestamp, _ = messages[selection_index]
+        _mark_read(message_id)
         result = _show_message_detail(
             ui,
             "Inbox",

@@ -168,3 +168,233 @@ the SIM7600 instead of the "requires Telephony... by M3" placeholder
 send_sms verified end-to-end against a pty fake modem speaking the
 real CMGS dance (prompt, body+Ctrl-Z, +CMGS ref, CMS ERROR reject),
 plus validation and sim paths. Messages app py_compile clean.
+
+---
+
+SMS receiving + NotifyService: BEEP BEEP, "1 message received"
+
+The other half of telephony round one. New NotifyService
+(System/core/NotifyService) does Nokia-3310 home-screen notifications
+(match the reference photo): tone immediately, "N message(s) received"
+banner mid-left with the carrier line hidden, softkey -> Read, C
+dismisses, flashing envelope in the status strip while unread mail
+exists. Deliberately NOT a modal framework -- nothing pops over running
+apps, and battery warnings keep their existing separate path.
+
+- ModemService: AT+CNMI=2,1 push notifications (+CMTI URC -> event, no
+  busy-polling), fetch_sms() (CMGR + CMGD -- messages are deleted from
+  the SIM so its ~30 slots never fill and silently stop reception),
+  read_stored_sms() boot sweep (CMGL "REC UNREAD") for messages that
+  arrived while the phone was off, busy/ok/error statuses with polite
+  event requeue when S45modem holds the port.
+- main.py glue in _modem_tick: modem events -> sms_inbox.db (existing
+  schema, zero Messages-app changes needed to list them) ->
+  notify.post_sms. Read softkey loads the Messages app module and jumps
+  straight into the message (single) or the Inbox (several).
+- Messages app: open_message()/open_inbox() entry points; opening a
+  message now marks it read (is_read existed but nothing ever set it).
+- Tone: user's "nokia sms" rip converted to mono 22 kHz wav (silence
+  trimmed, loudness normalized) at System/tones/sms.wav; played via
+  fire-and-forget aplay -- skips silently if the ALSA device is busy.
+  Invisible to the Tones ringtone list (it only scans mp3/wma).
+- New envelope.png status icon (stdlib-rasterized like the ModemInfo
+  placeholder), blinking at 2 Hz next to the signal bars.
+- Sim hook: echo '5551234|hey' > /tmp/neodct_sim_sms fakes an arrival
+  in QEMU without passthrough.
+
+Verified against the pty fake modem: boot sweep with multi-line bodies,
+live CMTI->CMGR->CMGD, requeue ordering, sim hook, banner
+pluralization/dismiss. All four touched files py_compile clean.
+
+---
+
+REAL VOICE CALLS: USB audio via CPCMREG + aplay, dial beeps
+
+Receive-audio-only call support (no mic hardware yet; test target is
+MCI's 1-800-444-4444 readback line):
+
+- allow_calls default flipped to ON -- the audio path exists now.
+- dial(): ATD, then IMMEDIATELY AT+CPCMREG=1, then pipe the PCM port
+  (USB interface 4, auto-detected via sysfs like the AT port) to the
+  speaker: `aplay -q -t raw -f S16_LE -r 16000 -c 1 /dev/ttyUSBn` as a
+  fire-and-forget subprocess. Early media/ringback plays if the network
+  sends it. answer() does the same for the future incoming-call UI.
+- Teardown everywhere kills aplay and defers AT+CPCMREG=0 to the next
+  free poll tick (URC handlers already hold the port lock): End key,
+  NO CARRIER, VOICE CALL: END, MISSED_CALL, service close().
+- call_screen: "Calling..." label until VOICE CALL: BEGIN, and the
+  screen exits on its own when the far end hangs up (modem.state IDLE
+  via the read_keypress URC pump) instead of waiting for End.
+- Fake DTMF beeps while typing a number on the home screen: 12 proper
+  dual-tone 16 kHz wavs (0-9/star/hash, 120 ms, 5 ms anti-click ramps)
+  in System/tones/dtmf/, played via NotifyService.play_tone. VoLTE
+  never hears them; they're pure Nokia vibes.
+
+pty fake-modem tests: ATD->CPCMREG=1 ordering, remote-end teardown with
+deferred CPCMREG=0, hangup path, allow_calls=OFF pretend fallback, DTMF
+wav format sweep. py_compile clean on ModemService/main/call_screen.
+
+---
+
+call monitoring: CLCC progress, audio-path logging, stuck-call recovery
+
+First live test: calls connect ("Call 1" = VOICE CALL: BEGIN arrived)
+but there was zero visibility into the audio path. Now:
+
+- dial() logs CPCMFRM/CPCMREG results; CPCMREG=1 re-asserted on the
+  first tick after connect (some firmwares reject it pre-call).
+- AT+CPCMFRM explicitly set: factory default is 8 kHz on many builds
+  while we play at 16 kHz -- the prime silent/garbled-audio suspect.
+  system.hw.modem_pcm_rate=8000 flips modem + aplay together.
+- AT+CLCC polled every 2 s in-call: "Call progress: CALLING/RINGING/
+  CONNECTED" in the console, "Ringing..." label + mm:ss timer on the
+  call screen, and empty-CLCC recovery that ends a stuck call state
+  when VOICE CALL: END was missed.
+- aplay watchdog: exit code logged, pipe restarted (3 s holdoff).
+- All call URCs now printed to the console.
+
+pty fake-modem tests: ATD->CPCMFRM->CPCMREG ordering, CLCC state
+progression driving call_status(), empty-CLCC stuck recovery with
+"ended" event, in-call CPCMREG retry.
+
+---
+
+INCOMING CALLS: the phone rings, interrupts apps, Answer/decline
+
+Round one of telephony is complete -- NeoDCT now receives calls.
+
+- IncomingCall(BaseException) raised from read_keypress (the chokepoint
+  every screen funnels through) unwinds whatever app is running. It
+  derives from BaseException exactly like KeyboardInterrupt so an app's
+  `except Exception` can't swallow a ringing phone; unwinding still runs
+  the apps' finally blocks, so MusicPlayer/Koki release the ALSA device
+  before the ringtone starts. launch_app/render_menu re-raise it instead
+  of showing the crash screen; the core loop catches it and rings. The
+  3310 didn't multitask either -- suspend/resume is post-alpha.
+- New System/ui/Dialer/incoming_screen.py, built to the 3310 photo:
+  caller name or number across the top (auto-shrunk; a full USA number
+  never runs off), flashing "calling" bottom-left, softkey "Answer",
+  C declines. Phonebook lookup matches on the last 10 digits so a stored
+  "555-1234" resolves a "+1616555..." caller ID. A late +CLIP updates
+  the label live; _ring_tick waits one poll cycle for it so the screen
+  doesn't open on "Unknown" (withheld numbers still ring after 0.6 s).
+  Caller hangs up first -> screen returns "gone" on its own.
+- NotifyService gained the ringer: system.audio.ringtone decoded once
+  and looped in-process via python-miniaudio (no ~24MB mpv), mpv as
+  fallback. Paths with spaces never touch a shell. Resolution chain
+  never rings silently: exact path -> same stem with another extension
+  (survives the .wma->.mp3 re-encode) -> Nokia Tune/Ring Ring -> any
+  playable tone, each step logged.
+  NOTE: settings.prop says "Brave Scottland.mp3"; the file is "Brave
+  Scotland.mp3" (one t) -- rings the fallback until that's fixed.
+- SettingsStorage default ringtone .wma -> .mp3.
+- Sim hook fix: /tmp/neodct_sim_ring rings once per write/touch
+  (mtime-tracked). It used to re-ring instantly after a decline, making
+  the decline path untestable; `rm` while ringing still = caller gave up.
+- Ring volume control in Tones is deliberately left for later.
+
+Tested against the real main.py/NotifyService/ModemService code (PIL and
+UI stubbed): exception semantics through a greedy app handler + finally,
+_ring_tick CLIP grace and withheld-number path, answer/decline/gone
+flows asserting ring-stop happens before answer takes ALSA, ringtone
+resolution (typo, space, wma->mp3, unset), loop generator wrap, and the
+sim ring hook lifecycle.
+
+---
+
+incoming screen: shift "calling" clear of the signal column
+
+First real incoming call screenshot showed "calling" overlapping the
+bottom of the signal-bar icons. The label now starts just right of the
+column, derived from the same scaling render_element uses for status
+icons (36px asset at x=7 scaled by H/240 -> ends at x=33; text at x=39).
+
+---
+
+default ringtone is Low.mp3 across the board
+
+- SettingsStorage DEFAULTS, the shipped User/settings.prop, and the head
+  of NotifyService's never-silent fallback chain all agree on
+  /NeoDCT/System/tones/Low.mp3 now (was a mix of Entertainer and the
+  Brave Scotland test value).
+
+---
+
+FULL-DUPLEX CALLS: mic uplink via arecord into the PCM port
+
+The other half of the audio path -- a complete NeoDCT OS phone call.
+The SIM7600's CPCMREG stream is bidirectional, so the uplink mirrors
+the downlink with pure alsa-utils plumbing:
+
+    speaker <- aplay   <- /dev/ttyUSBn   (far end's voice, existing)
+    far end <- /dev/ttyUSBn <- arecord   (USB sound card mic, NEW)
+
+- arecord -q -t raw -f S16_LE -r <pcm_rate> -c 1 -D <dev> <port>,
+  spawned next to aplay at dial/answer, killed with it at teardown.
+  arecord ships in the image already (alsa-utils APLAY installs both).
+- system.hw.modem_mic_device picks the capture device ("default";
+  "plughw:N,0" to pin; OFF/NONE for deliberate listen-only).
+- Watchdogs split: speaker restarts indefinitely (3 s holdoff), the mic
+  gets three attempts then gives up into listen-only with a logged hint
+  (`arecord -l`) -- a guest without a capture device is a normal state,
+  not something to spin on.
+- Real hardware uses an embedded stripped USB sound card = the exact
+  same snd-usb-audio path as QEMU passthrough; this plumbing is final.
+  If QEMU's usb-audio turns out playback-only (`arecord -l` empty),
+  virtio-sound-pci does capture and CONFIG_SND_VIRTIO=y already ships.
+
+Tested with recorded-Popen fakes over a pty PCM port: dual spawn with
+correct args, mic three-strikes -> listen-only (then stays quiet),
+speaker restart, hangup kills all live pipes, OFF/custom device
+settings pass through. py_compile clean.
+
+---
+
+mic uplink: auto-detect the capture card (QEMU usb-audio is playback-only)
+
+First full-duplex field test confirmed QEMU's usb-audio device exposes
+zero capture endpoints (arecord -l empty in the guest) -- the mic pipe
+did its 3-strikes give-up as designed. The fix is passing the USB mic
+itself through (same snd-usb-audio path as the real phone's embedded
+sound card), which creates a second guest sound card... where ALSA's
+"default" (card 0 = playback-only QEMU USB Audio) becomes a trap.
+
+- system.hw.modem_mic_device now defaults to AUTO: scan /proc/asound
+  for the first cardN with a pcm*c (capture) node -> plughw:N,M.
+  Explicit devices still pass through; OFF still means listen-only.
+- No capture device found = one clean log line and a listen-only call,
+  not three arecord deaths.
+- Also confirmed in the field: CPCMREG=1 -> ERROR at dial time on this
+  firmware, then OK on the post-connect retry -- the retry path earns
+  its keep.
+
+Tested against a fake /proc/asound tree: playback-only card 0 + mic on
+card 1 -> plughw:1,0; capture on card 0 (real-hardware shape) ->
+plughw:0,0; no capture -> mic pipe skipped; hotplug found on next call.
+
+---
+
+i2c: all bus defaults 1 -> 3 (real hw scan) + version bump to 0.3.0a
+
+i2cdetect on the board found the whole peripheral chain on i2c-3
+(PCF8575 keypad @ 0x20, MAX1704x gauge @ 0x36); every driver assumed
+bus 1, so on hardware BatteryService would have probed /dev/i2c-1 and
+silently run Simulation Mode (fixed 3.85 V).
+
+- system.hw.battery_i2c_bus: SettingsStorage default "1" -> "3", plus
+  explicit override in User/settings.prop
+- BatteryService DEFAULT_I2C_BUS, pcf8575_keypad DEFAULT_BUS (feeds
+  KeypadMapperI2C and the keymap.json it writes), core/main.py
+  keymap i2c_bus fallback, max1704x_watch --bus default: all 1 -> 3
+- NOTE: keymap.json files generated before this carry i2c_bus 1;
+  re-run KeypadMapperI2C on units mapped earlier
+
+Version 0.3.0a everywhere: SettingsStorage defaults (was 0.2.4a),
+launcher.py splash (0.2.4a), etc/os-release (0.2.2a!), and the
+BR2_TARGET_GENERIC_ISSUE banner in qemu/luckfox/radxa defconfigs
+(0.2.3a). settings.prop + docs/CHANGELOG.txt were already 0.3.0a.
+Re-run make <defconfig> before the next luckfox build or the stale
+issue banner in build-luckfox/.config ships again.
+
+py_compile clean on all six touched .py files; historical 0.2.4a
+references in BatteryService's docstring left alone on purpose.
