@@ -308,3 +308,66 @@ First real incoming call screenshot showed "calling" overlapping the
 bottom of the signal-bar icons. The label now starts just right of the
 column, derived from the same scaling render_element uses for status
 icons (36px asset at x=7 scaled by H/240 -> ends at x=33; text at x=39).
+
+---
+
+default ringtone is Low.mp3 across the board
+
+- SettingsStorage DEFAULTS, the shipped User/settings.prop, and the head
+  of NotifyService's never-silent fallback chain all agree on
+  /NeoDCT/System/tones/Low.mp3 now (was a mix of Entertainer and the
+  Brave Scotland test value).
+
+---
+
+FULL-DUPLEX CALLS: mic uplink via arecord into the PCM port
+
+The other half of the audio path -- a complete NeoDCT OS phone call.
+The SIM7600's CPCMREG stream is bidirectional, so the uplink mirrors
+the downlink with pure alsa-utils plumbing:
+
+    speaker <- aplay   <- /dev/ttyUSBn   (far end's voice, existing)
+    far end <- /dev/ttyUSBn <- arecord   (USB sound card mic, NEW)
+
+- arecord -q -t raw -f S16_LE -r <pcm_rate> -c 1 -D <dev> <port>,
+  spawned next to aplay at dial/answer, killed with it at teardown.
+  arecord ships in the image already (alsa-utils APLAY installs both).
+- system.hw.modem_mic_device picks the capture device ("default";
+  "plughw:N,0" to pin; OFF/NONE for deliberate listen-only).
+- Watchdogs split: speaker restarts indefinitely (3 s holdoff), the mic
+  gets three attempts then gives up into listen-only with a logged hint
+  (`arecord -l`) -- a guest without a capture device is a normal state,
+  not something to spin on.
+- Real hardware uses an embedded stripped USB sound card = the exact
+  same snd-usb-audio path as QEMU passthrough; this plumbing is final.
+  If QEMU's usb-audio turns out playback-only (`arecord -l` empty),
+  virtio-sound-pci does capture and CONFIG_SND_VIRTIO=y already ships.
+
+Tested with recorded-Popen fakes over a pty PCM port: dual spawn with
+correct args, mic three-strikes -> listen-only (then stays quiet),
+speaker restart, hangup kills all live pipes, OFF/custom device
+settings pass through. py_compile clean.
+
+---
+
+mic uplink: auto-detect the capture card (QEMU usb-audio is playback-only)
+
+First full-duplex field test confirmed QEMU's usb-audio device exposes
+zero capture endpoints (arecord -l empty in the guest) -- the mic pipe
+did its 3-strikes give-up as designed. The fix is passing the USB mic
+itself through (same snd-usb-audio path as the real phone's embedded
+sound card), which creates a second guest sound card... where ALSA's
+"default" (card 0 = playback-only QEMU USB Audio) becomes a trap.
+
+- system.hw.modem_mic_device now defaults to AUTO: scan /proc/asound
+  for the first cardN with a pcm*c (capture) node -> plughw:N,M.
+  Explicit devices still pass through; OFF still means listen-only.
+- No capture device found = one clean log line and a listen-only call,
+  not three arecord deaths.
+- Also confirmed in the field: CPCMREG=1 -> ERROR at dial time on this
+  firmware, then OK on the post-connect retry -- the retry path earns
+  its keep.
+
+Tested against a fake /proc/asound tree: playback-only card 0 + mic on
+card 1 -> plughw:1,0; capture on card 0 (real-hardware shape) ->
+plughw:0,0; no capture -> mic pipe skipped; hotplug found on next call.

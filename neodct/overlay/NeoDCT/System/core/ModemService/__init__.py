@@ -25,14 +25,22 @@ arrived while the phone was off (queued as ("sms_stored_check", None)
 right after the modem is adopted). Fetched messages are deleted from the
 SIM so its ~30 slots never fill up and silently stop reception.
 
-Calls are LIVE (receive-audio only -- no microphone yet): dial() sends
-ATD, then immediately AT+CPCMREG=1 to route call audio over USB, then
-pipes the modem's PCM port (interface 4, 16 kHz mono S16_LE) straight to
-the speaker with a fire-and-forget `aplay -t raw` subprocess -- zero
-in-process audio code. Call end (VOICE CALL: END / NO CARRIER / hangup)
-kills the pipe and schedules AT+CPCMREG=0. The system.modem.allow_calls
-setting now defaults ON; set it OFF to fall back to the old pretend
-flow (CALLING -> CONNECTED after 2 s, no AT traffic).
+Calls are LIVE and FULL-DUPLEX: dial() sends ATD, then immediately
+AT+CPCMREG=1 to route call audio over USB (the PCM port on interface 4
+is bidirectional), then runs two fire-and-forget alsa-utils pipes:
+
+    speaker <- aplay   <- PCM port    (the far end's voice)
+    far end <- PCM port <- arecord    (our mic, via the USB sound card)
+
+Zero in-process audio code. The mic ALSA device comes from
+system.hw.modem_mic_device (default AUTO = first card that can capture,
+found via /proc/asound -- QEMU's playback-only USB Audio card makes
+"default" a trap; set OFF for listen-only). No capture device at all
+degrades cleanly to listen-only. Call end (VOICE CALL: END / NO CARRIER
+/ hangup) kills
+both pipes and schedules AT+CPCMREG=0. The system.modem.allow_calls
+setting defaults ON; set it OFF to fall back to the old pretend flow
+(CALLING -> CONNECTED after 2 s, no AT traffic).
 
 If no AT port answers, the service runs in Simulation Mode (boot log says
 so, like BatteryService) and quietly re-probes every PROBE_RETRY_S, so a
@@ -52,6 +60,7 @@ import time
 from collections import deque
 
 LOCK_FILE = "/tmp/neodct-modem.lock"
+ASOUND_DIR = "/proc/asound"
 SIM_CSQ_FILE = "/tmp/neodct_sim_csq"
 SIM_RING_FILE = "/tmp/neodct_sim_ring"
 SIM_OPS_FILE = "/tmp/neodct_sim_operator"
@@ -113,7 +122,10 @@ class ModemService:
         self._next_cops = 0.0
         self._next_probe = 0.0
         self._sim_connect_at = None
-        self._audio_proc = None     # aplay piping the PCM port to ALSA
+        self._audio_proc = None     # aplay: PCM port -> speaker (downlink)
+        self._mic_proc = None       # arecord: mic -> PCM port (uplink)
+        self._active_pcm_port = None
+        self._mic_fails = 0
         self._pcm_cleanup = False   # send AT+CPCMREG=0 on a later tick
         self._pcm_retry = False     # re-assert CPCMREG=1 once connected
         self._call_stat = None      # last AT+CLCC <stat> during a call
@@ -509,16 +521,34 @@ class ModemService:
             self.state = "CONNECTED"
 
     def _watch_audio_proc(self, now):
-        """Restart aplay if it died mid-call (device busy, bad open...)."""
-        if self._audio_proc is None or self._audio_proc.poll() is None:
+        """Restart a pipe that died mid-call.
+
+        The speaker retries indefinitely (with holdoff). The mic gets
+        three tries, then the call carries on listen-only: no capture
+        device is a normal state (e.g. QEMU without a capture-capable
+        audio device), not something to spin on.
+        """
+        port = self._active_pcm_port
+        if port is None or now < self._next_audio_restart:
             return
-        if now < self._next_audio_restart:
-            return
-        self._next_audio_restart = now + AUDIO_RESTART_HOLDOFF_S
-        print(f"[MODEM] aplay exited rc={self._audio_proc.returncode} "
-              "mid-call; restarting the audio pipe.")
-        self._audio_proc = None
-        self._start_call_audio()
+        if self._audio_proc is not None and self._audio_proc.poll() is not None:
+            self._next_audio_restart = now + AUDIO_RESTART_HOLDOFF_S
+            print(f"[MODEM] Speaker pipe exited rc={self._audio_proc.returncode} "
+                  "mid-call; restarting.")
+            self._audio_proc = None
+            self._start_speaker_pipe(port)
+        if self._mic_proc is not None and self._mic_proc.poll() is not None:
+            rc = self._mic_proc.returncode
+            self._mic_proc = None
+            self._mic_fails += 1
+            if self._mic_fails >= 3:
+                print(f"[MODEM] Mic pipe keeps dying (rc={rc}); giving up -- "
+                      "call continues listen-only. Check `arecord -l` and "
+                      "the system.hw.modem_mic_device setting.")
+            else:
+                self._next_audio_restart = now + AUDIO_RESTART_HOLDOFF_S
+                print(f"[MODEM] Mic pipe exited rc={rc}; retrying.")
+                self._start_mic_pipe(port)
 
     def call_status(self):
         """(label, connected_seconds|None) for the in-call screen."""
@@ -615,14 +645,45 @@ class ModemService:
                 continue
         return "/dev/ttyUSB4"
 
-    def _start_call_audio(self):
-        """Pipe the PCM port to the speaker: aplay reads the raw stream.
+    @staticmethod
+    def _mic_device_setting():
+        try:
+            from System.core.SettingsStorage import get_setting
+            return str(get_setting("system.hw.modem_mic_device", "AUTO")).strip()
+        except Exception:
+            return "AUTO"
 
-        Receive-only by design (no microphone hardware yet). Fire and
-        forget -- if aplay or the port is missing the call is silent but
-        everything else keeps working.
+    @staticmethod
+    def _find_capture_device():
+        """First ALSA device that can actually capture, as plughw:N,M.
+
+        "default" is a trap once the guest has two cards (QEMU's USB
+        Audio is playback-only card 0; a passed-through mic lands on
+        card 1): ALSA's default maps to card 0 and arecord dies. Scan
+        /proc/asound/cardN for pcm*c (c = capture) instead.
         """
-        if self._audio_proc is not None:
+        try:
+            for entry in sorted(os.listdir(ASOUND_DIR)):
+                if not entry.startswith("card") or not entry[4:].isdigit():
+                    continue
+                for node in sorted(os.listdir(os.path.join(ASOUND_DIR, entry))):
+                    if node.startswith("pcm") and node.endswith("c") \
+                            and node[3:-1].isdigit():
+                        return "plughw:%s,%s" % (entry[4:], node[3:-1])
+        except Exception:
+            pass
+        return None
+
+    def _start_call_audio(self):
+        """Full-duplex call audio over the bidirectional PCM port:
+
+            speaker <- aplay   <- PCM port    (far end's voice)
+            far end <- PCM port <- arecord    (our USB sound card mic)
+
+        Fire and forget both ways: no mic device means the call is
+        listen-only, no PCM port means silent -- everything else works.
+        """
+        if self._audio_proc is not None or self._mic_proc is not None:
             return
         port = self._pcm_port()
         if not self._exists(port):
@@ -635,6 +696,16 @@ class ModemService:
             attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             os.close(fd)
+        except Exception as exc:
+            print(f"[MODEM] PCM port setup failed: {exc}")
+            return
+        self._active_pcm_port = port
+        self._mic_fails = 0
+        self._start_speaker_pipe(port)
+        self._start_mic_pipe(port)
+
+    def _start_speaker_pipe(self, port):
+        try:
             self._audio_proc = subprocess.Popen(
                 ["aplay", "-q", "-t", "raw", "-f", PCM_FORMAT,
                  "-r", str(self._pcm_rate), "-c", "1", port],
@@ -645,18 +716,50 @@ class ModemService:
                   f"({self._pcm_rate} Hz {PCM_FORMAT}).")
         except Exception as exc:
             self._audio_proc = None
-            print(f"[MODEM] Call audio unavailable: {exc}")
+            print(f"[MODEM] Speaker pipe unavailable: {exc}")
+
+    def _start_mic_pipe(self, port):
+        device = self._mic_device_setting()
+        if device.upper() in ("", "OFF", "NONE"):
+            print("[MODEM] Mic uplink disabled (system.hw.modem_mic_device=OFF).")
+            return
+        if device.upper() == "AUTO":
+            device = self._find_capture_device()
+            if device is None:
+                print("[MODEM] No ALSA capture device found (arecord -l); "
+                      "call is listen-only.")
+                return
+            print(f"[MODEM] Mic auto-detected: {device}")
+        try:
+            self._mic_proc = subprocess.Popen(
+                ["arecord", "-q", "-t", "raw", "-f", PCM_FORMAT,
+                 "-r", str(self._pcm_rate), "-c", "1", "-D", device, port],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[MODEM] Mic uplink: arecord -D {device} -> {port} "
+                  f"({self._pcm_rate} Hz {PCM_FORMAT}).")
+        except Exception as exc:
+            self._mic_proc = None
+            print(f"[MODEM] Mic uplink unavailable ({exc}); call is listen-only.")
 
     def _stop_call_audio(self):
-        """Kill the audio pipe; CPCMREG=0 goes out on the next free tick."""
-        if self._audio_proc is not None:
+        """Kill both audio pipes; CPCMREG=0 goes out on the next free tick."""
+        stopped = False
+        for attr in ("_audio_proc", "_mic_proc"):
+            proc = getattr(self, attr)
+            if proc is None:
+                continue
             try:
-                self._audio_proc.kill()
-                self._audio_proc.wait(timeout=1)
+                proc.kill()
+                proc.wait(timeout=1)
             except Exception:
                 pass
-            self._audio_proc = None
+            setattr(self, attr, None)
+            stopped = True
+        if stopped:
             print("[MODEM] Call audio stopped.")
+        self._active_pcm_port = None
         self._call_stat = None
         self._call_connected_at = None
         if self.hardware:

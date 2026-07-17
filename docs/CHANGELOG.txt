@@ -48,6 +48,30 @@ Modem (SIM7600G bring-up -- MODEM SUPPORT!)
   nodes exist instead, so "why is there no modem" is debuggable on-screen
   without a serial console.
 
+Calls -- FULL DUPLEX (microphone uplink!)
+- Calls now carry our voice too: alongside the existing downlink pipe
+  (aplay: PCM port -> speaker), dialing/answering starts an uplink pipe
+  (arecord: USB sound card mic -> PCM port; the CPCMREG stream is
+  bidirectional). Still pure alsa-utils plumbing, still zero in-process
+  audio code. Same rate both directions (CPCMFRM /
+  system.hw.modem_pcm_rate).
+- Mic ALSA device: system.hw.modem_mic_device (default "default"; a
+  pinned "plughw:N,0" works too; OFF/NONE = deliberate listen-only).
+- Graceful degradation: no capture device in the guest means arecord
+  dies -- it gets three attempts (logged with exit codes), then the call
+  carries on listen-only with a hint to check `arecord -l`. The speaker
+  pipe keeps its own indefinite watchdog. Hangup/teardown kills both
+  pipes.
+- On real hardware the embedded stripped USB sound card is the same
+  snd-usb-audio path as QEMU's passthrough card, so this plumbing is
+  the final shape. QEMU note: if `arecord -l` shows no capture device,
+  QEMU's usb-audio may be playback-only -- virtio-sound
+  (-device virtio-sound-pci, QEMU 8.2+) does capture and the kernel
+  already ships CONFIG_SND_VIRTIO=y.
+- Verified with recorded-Popen tests over a pty PCM port: both pipes
+  spawn with correct formats/paths, mic three-strikes give-up, speaker
+  restart, teardown kills live pipes, OFF and custom device settings.
+
 Calls -- INCOMING (the phone rings!)
 - The phone now rings on incoming calls and interrupts whatever app is
   running, like the real 3310 (it didn't multitask either; a nicer

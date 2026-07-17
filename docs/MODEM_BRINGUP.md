@@ -119,15 +119,23 @@ probe-or-simulate pattern as BatteryService):
   real operator name ("Tello" / "T-Mobile", short-format `AT+COPS=3,1`)
   once registered; it falls back to "No Service" whenever registration
   drops.
-* **Calls are LIVE (receive-audio only)**: `system.modem.allow_calls`
-  now defaults ON (OFF restores the pretend flow). `dial()` sends `ATD`,
-  then immediately `AT+CPCMREG=1`, then pipes the PCM port to the
-  speaker with `aplay -q -t raw -f S16_LE -r 16000 -c 1 /dev/ttyUSBn` —
-  pure BusyBox plumbing. No microphone yet, so the far end hears
-  silence. Teardown (End key, `NO CARRIER`, `VOICE CALL: END`) kills the
-  pipe and sends `AT+CPCMREG=0`; the call screen exits by itself on
-  remote hangup. Typing a number plays fake DTMF beeps
-  (`System/tones/dtmf/`). Test line: 1-800-444-4444 (MCI readback).
+* **Calls are LIVE and FULL-DUPLEX**: `system.modem.allow_calls`
+  defaults ON (OFF restores the pretend flow). `dial()` sends `ATD`,
+  then immediately `AT+CPCMREG=1`, then runs two alsa-utils pipes on the
+  bidirectional PCM port: `aplay -t raw -f S16_LE -r 16000 -c 1
+  /dev/ttyUSBn` (downlink → speaker) and `arecord … -D <mic> /dev/ttyUSBn`
+  (USB sound card mic → uplink). Mic device:
+  `system.hw.modem_mic_device` ("default"; `plughw:N,0` to pin;
+  OFF = listen-only; three arecord failures auto-degrade to listen-only
+  — check `arecord -l` and capture levels with `amixer`). Teardown
+  (End key, `NO CARRIER`, `VOICE CALL: END`) kills both pipes and sends
+  `AT+CPCMREG=0`; the call screen exits by itself on remote hangup.
+  Typing a number plays fake DTMF beeps (`System/tones/dtmf/`). Test
+  line: 1-800-444-4444 (MCI readback — it reads your voice channel back,
+  so hearing your own mic echo confirms full duplex!). QEMU note: if
+  `arecord -l` in the guest is empty, QEMU's usb-audio is playback-only
+  on your build — use `-device virtio-sound-pci,audiodev=audio0`
+  instead/alongside (kernel already has `CONFIG_SND_VIRTIO=y`).
   Bench note: LTE TX during a call is the worst case for the missing
   capacitor — if the modem vanishes mid-call, that's the brownout.
 * **Coexistence**: every port transaction takes the advisory lock

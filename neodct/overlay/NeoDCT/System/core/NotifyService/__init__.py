@@ -43,7 +43,9 @@ RING_RATE = 44100
 RING_BUF_MS = 500
 RING_SETTING = "system.audio.ringtone"
 # Last-resort ringtones if the configured one is missing/unplayable.
-RING_FALLBACKS = (os.path.join(TONES_DIR, "Nokia Tune.mp3"),
+# Low.mp3 is the system default ringtone across the board.
+RING_FALLBACKS = (os.path.join(TONES_DIR, "Low.mp3"),
+                  os.path.join(TONES_DIR, "Nokia Tune.mp3"),
                   os.path.join(TONES_DIR, "Ring Ring.mp3"),
                   SMS_TONE)
 
