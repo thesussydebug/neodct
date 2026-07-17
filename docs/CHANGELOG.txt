@@ -210,6 +210,29 @@ MusicPlayer
 - BR2_PACKAGE_PYTHON_MINIAUDIO=y added to the qemu + luckfox defconfigs
   (it lived only in the live .config; a clean rebuild would drop it).
 
+Hardware I2C bus
+- Real hardware puts the peripheral chain on i2c-3 (i2cdetect on the
+  board: PCF8575 keypad expander at 0x20, MAX1704x fuel gauge at 0x36,
+  both on bus 3), but every driver defaulted to bus 1 -- BatteryService
+  would have probed /dev/i2c-1, found nothing, and silently dropped into
+  Simulation Mode (fixed 3.85 V forever). All bus defaults now say 3:
+  system.hw.battery_i2c_bus (SettingsStorage default + explicit
+  User/settings.prop override), BatteryService DEFAULT_I2C_BUS,
+  pcf8575_keypad DEFAULT_BUS (covers the KeypadMapperI2C engineering
+  app, which bakes the bus into the keymap.json it writes), the
+  keymap.json i2c_bus fallback in core/main.py, and the max1704x_watch
+  --bus default.
+- A keymap.json generated before this change carries i2c_bus 1 inside
+  it; re-run KeypadMapperI2C (or edit the file) on any unit mapped
+  earlier.
+
+Versioning
+- Version strings bumped to 0.3.0a everywhere one lived: SettingsStorage
+  defaults, launcher.py boot splash, /etc/os-release, and the
+  BR2_TARGET_GENERIC_ISSUE banner in the qemu/luckfox/radxa defconfigs
+  (the qemu + luckfox ones still said 0.2.3a; re-run make <defconfig>
+  or the stale banner in the live build .config ships again).
+
 Version 0.2.4a - 2026-07-13
 
 Power/Battery

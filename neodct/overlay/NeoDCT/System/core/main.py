@@ -196,7 +196,7 @@ def _load_matrix_keymap(path=KEYMAP_PATH):
             i2c_addr = int(i2c_addr_raw, 16) if i2c_addr_raw.lower().startswith("0x") else int(i2c_addr_raw)
         else:
             i2c_addr = int(i2c_addr_raw)
-        i2c_bus = int(payload.get("i2c_bus", 1))
+        i2c_bus = int(payload.get("i2c_bus", 3))
     except Exception as exc:
         print(f"[INPUT] Keymap ignored (invalid i2c fields): {exc}")
         return None

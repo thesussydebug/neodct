@@ -67,7 +67,7 @@ def signed16(v):
 
 def main():
     ap = argparse.ArgumentParser(description="MAX1704x live watcher")
-    ap.add_argument("--bus", type=int, default=1)
+    ap.add_argument("--bus", type=int, default=3)
     ap.add_argument("--addr", type=lambda s: int(s, 0), default=0x36)
     ap.add_argument("--interval", type=float, default=0.25,
                     help="seconds between samples (default 0.25)")

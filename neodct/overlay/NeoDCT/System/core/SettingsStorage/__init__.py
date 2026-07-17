@@ -5,9 +5,9 @@ DEFAULTS = {
     "system.audio.ringtone": "/NeoDCT/System/tones/Low.mp3",
     "system.ui.wallpaper": "NONE",
     "system.ui.engineering_mode": "ON",
-    "system.os.versionnumber": "0.2.4a",
-    "system.os.versionname": "NeoDCT System v0.2.4a",
-    "system.hw.battery_i2c_bus": "1",
+    "system.os.versionnumber": "0.3.0a",
+    "system.os.versionname": "NeoDCT System v0.3.0a",
+    "system.hw.battery_i2c_bus": "3",
     "system.hw.battery_i2c_addr": "0x36",
 }
 
