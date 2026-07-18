@@ -315,15 +315,6 @@ class Framebuffer:
         self.native_img = None
         self._black = (0, 0, 0)
 
-        # RGB565 fallback lookup tables + buffers are only needed on the
-        # 16bpp-without-"BGR;16" path; allocate them lazily so the common
-        # 32bpp / BGR;16 configs don't pin ~350 KB for nothing (64 MB device).
-        self._r565 = None
-        self._g565 = None
-        self._b565 = None
-        self._rgb565_out = None
-        self._rgb565_band_out = None
-
         # Detect the pixel conversion path ONCE (Pillow >= 11 removed the
         # "BGR;16" packer, which silently forced the slow Python loop).
         self._has_bgr16 = False
@@ -341,14 +332,14 @@ class Framebuffer:
         else:
             path = "PYTHON RGB565 PACK 16bpp (SLOW -- ~350ms/frame on RV1103!)"
         print(f"[FB] {self.xres}x{self.yres} @ {self.bpp}bpp, pixel path: {path}")
+
+        # RGB565 fallback tables/buffers exist only on the 16bpp-without-
+        # "BGR;16" path; other configs don't pin ~350 KB (64 MB device).
+        self._r565 = self._g565 = self._b565 = None
+        self._rgb565_out = self._rgb565_band_out = None
         if self.bpp == 16 and not self._has_bgr16:
             print("[FB] WARNING: on hardware, ensure neodct_displayd v2.1+ runs "
                   "BEFORE the UI so the framebuffer is switched to 32bpp.")
-
-    def _ensure_565_fallback(self):
-        """Build the lookup tables and output buffers for the pure-Python
-        RGB565 pack on first use (16bpp fb without Pillow's BGR;16 packer)."""
-        if self._r565 is None:
             self._r565 = [(i & 0xF8) << 8 for i in range(256)]
             self._g565 = [(i & 0xFC) << 3 for i in range(256)]
             self._b565 = [(i >> 3) for i in range(256)]
@@ -356,7 +347,6 @@ class Framebuffer:
             self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
 
     def _pack_rgb565(self, src_bytes, out_buf):
-        self._ensure_565_fallback()
         r565 = self._r565
         g565 = self._g565
         b565 = self._b565
@@ -414,7 +404,6 @@ class Framebuffer:
                 if self._has_bgr16:
                     band = src.tobytes("raw", "BGR;16")
                 else:
-                    self._ensure_565_fallback()
                     src_bytes = src.tobytes()
                     used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
                     band = self._rgb565_band_out[:used]
@@ -440,7 +429,6 @@ class Framebuffer:
                 data = rgb_img.tobytes("raw", "BGR;16")
             else:
                 # Fallback for Pillow >= 11 builds: software-pack RGB565.
-                self._ensure_565_fallback()
                 out = self._rgb565_out
                 self._pack_rgb565(rgb_img.tobytes(), out)
                 data = out
@@ -747,12 +735,15 @@ class NeoDCT_UI:
             img = Image.open(clean_path).convert("RGBA")
             if max_size is not None and (img.width > max_size or img.height > max_size):
                 img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            # FIFO cap so the cache cannot grow without bound on 64 MB.
-            if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
-                self.image_cache.pop(next(iter(self.image_cache)))
-            self.image_cache[key] = img
+            self._cache_put(key, img)
             return img
         except: return None
+
+    def _cache_put(self, key, img):
+        # FIFO cap so the cache cannot grow without bound on 64 MB.
+        if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
+            self.image_cache.pop(next(iter(self.image_cache)))
+        self.image_cache[key] = img
 
     def get_text_size(self, text, font):
         bbox = self.draw.textbbox((0, 0), text, font=font)
@@ -807,7 +798,8 @@ class NeoDCT_UI:
                 img = self._get_status_icon(custom_path)
                 if img:
                     self.canvas.paste(img, (x, y), img)
-                    vis_box = img.getbbox() or (0, 0, img.width, img.height)
+                    if bat_label is not None:
+                        vis_box = img.getbbox() or (0, 0, img.width, img.height)
             else:
                 step = max(3, int(self.W * 0.021))
                 for i in range(count):
@@ -823,26 +815,23 @@ class NeoDCT_UI:
                 self._draw_status_label(bat_label, x, y, vis_box or (0, 0, 12, 15))
 
     def _get_status_icon(self, path):
-        """Status-bar sprite, pre-scaled for this display height and cached.
-        Home layout coords are authored for a 240px-tall UI; icons scale by
-        height ratio so they don't clip. Caching the SCALED copy avoids a
-        LANCZOS resize on every frame of the home screen."""
-        icon_scale = self.H / 240.0
-        img = self.get_image(path)
-        if img is None:
+        """Status-bar sprite, scaled by H/240 (home layout coords are authored
+        for a 240px-tall UI) and cached at display size only."""
+        skey = f"{path}@s{self.H}"
+        cached = self.image_cache.get(skey)
+        if cached is not None:
+            return cached
+        try:
+            img = Image.open(path).convert("RGBA")
+        except Exception:
             return None
+        icon_scale = self.H / 240.0
         scaled_w = max(1, int(img.width * icon_scale))
         scaled_h = max(1, int(img.height * icon_scale))
-        if (scaled_w, scaled_h) == img.size:
-            return img
-        skey = f"{path}@{scaled_w}x{scaled_h}"
-        cached = self.image_cache.get(skey)
-        if cached is None:
-            cached = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
-            if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
-                self.image_cache.pop(next(iter(self.image_cache)))
-            self.image_cache[skey] = cached
-        return cached
+        if (scaled_w, scaled_h) != img.size:
+            img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+        self._cache_put(skey, img)
+        return img
 
     def _draw_status_label(self, text, icon_x, icon_y, vis_box):
         """Draw a small status value (e.g. battery '85%' or '?') just left of the
@@ -894,13 +883,9 @@ class NeoDCT_UI:
         # status strip while unread mail exists, banner while undismissed.
         if self.notify.active() or self._unread_sms > 0:
             if int(time.time() * 2) % 2 == 0:
-                env = self.get_image("/NeoDCT/System/ui/resources/img/envelope.png")
+                env = self._get_status_icon("/NeoDCT/System/ui/resources/img/envelope.png")
                 if env:
                     icon_scale = self.H / 240.0
-                    w = max(1, int(env.width * icon_scale))
-                    h = max(1, int(env.height * icon_scale))
-                    if (w, h) != env.size:
-                        env = env.resize((w, h), Image.Resampling.LANCZOS)
                     self.canvas.paste(env, (int(46 * icon_scale) + 7,
                                             int(10 * icon_scale)), env)
         if self.notify.active():
