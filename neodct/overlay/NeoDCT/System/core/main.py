@@ -711,14 +711,16 @@ class NeoDCT_UI:
             
     IMAGE_CACHE_MAX = 32
 
-    def get_image(self, path, max_size=None):
+    def get_image(self, path, max_size=None, scale=None):
         """Load (and cache) an RGBA image.
 
         max_size: optional int -- downscale so neither side exceeds it and
         cache the SCALED copy under a separate key. Callers that only ever
-        draw an icon small (AppSelector, status icons) should pass this so
-        the cache holds ~KB thumbnails instead of full-size art; on 64 MB
-        the full-size icon set alone is ~1 MB of RGBA.
+        draw an icon small (AppSelector) should pass this so the cache holds
+        ~KB thumbnails instead of full-size art; on 64 MB the full-size icon
+        set alone is ~1 MB of RGBA.
+        scale: optional float -- exact-ratio resize, cached at display size
+        only (status-bar sprites via _get_status_icon).
         """
         if path.startswith("/home"):
             if "System" in path:
@@ -727,7 +729,12 @@ class NeoDCT_UI:
             else: clean_path = path
         else: clean_path = path
 
-        key = clean_path if max_size is None else f"{clean_path}@{int(max_size)}"
+        if max_size is not None:
+            key = f"{clean_path}@{int(max_size)}"
+        elif scale is not None:
+            key = f"{clean_path}@x{scale:g}"
+        else:
+            key = clean_path
         if key in self.image_cache:
             return self.image_cache[key]
 
@@ -735,6 +742,11 @@ class NeoDCT_UI:
             img = Image.open(clean_path).convert("RGBA")
             if max_size is not None and (img.width > max_size or img.height > max_size):
                 img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            elif scale is not None:
+                w = max(1, int(img.width * scale))
+                h = max(1, int(img.height * scale))
+                if (w, h) != img.size:
+                    img = img.resize((w, h), Image.Resampling.LANCZOS)
             self._cache_put(key, img)
             return img
         except: return None
@@ -815,23 +827,9 @@ class NeoDCT_UI:
                 self._draw_status_label(bat_label, x, y, vis_box or (0, 0, 12, 15))
 
     def _get_status_icon(self, path):
-        """Status-bar sprite, scaled by H/240 (home layout coords are authored
-        for a 240px-tall UI) and cached at display size only."""
-        skey = f"{path}@s{self.H}"
-        cached = self.image_cache.get(skey)
-        if cached is not None:
-            return cached
-        try:
-            img = Image.open(path).convert("RGBA")
-        except Exception:
-            return None
-        icon_scale = self.H / 240.0
-        scaled_w = max(1, int(img.width * icon_scale))
-        scaled_h = max(1, int(img.height * icon_scale))
-        if (scaled_w, scaled_h) != img.size:
-            img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
-        self._cache_put(skey, img)
-        return img
+        """Status-bar sprite scaled by H/240 (home layout coords are authored
+        for a 240px-tall UI), cached at display size only."""
+        return self.get_image(path, scale=self.H / 240.0)
 
     def _draw_status_label(self, text, icon_x, icon_y, vis_box):
         """Draw a small status value (e.g. battery '85%' or '?') just left of the

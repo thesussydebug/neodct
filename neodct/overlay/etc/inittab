@@ -13,9 +13,9 @@
 tty1::once:/bin/run_neodct.sh
 
 # 3. The "Debug" Shell (Serial Port)
-# getty_guard.sh spawns getty only if the tty exists (ttyFIQ0 = Luckfox
-# FIQ debugger, ttyAMA0 = QEMU PL011); the absent one parks quietly
-# instead of respawn-spamming "can't open".
+# getty_guard.sh spawns getty at 115200 only if the tty exists
+# (ttyFIQ0 = Luckfox FIQ debugger, ttyAMA0 = QEMU PL011).
+# Luckfox-flavor builds replace this file with inittab.luckfox (1500000).
 ::respawn:/bin/getty_guard.sh ttyFIQ0
 ::respawn:/bin/getty_guard.sh ttyAMA0
 
