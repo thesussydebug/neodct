@@ -12,6 +12,7 @@ import json
 import fcntl
 import traceback
 import glob
+import gc
 # --- THE FIX: Import ImageFile to handle "broken" JPEGs ---
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFile 
 from System.ui.framework import AppSelector, SoftKeyBar
@@ -21,7 +22,7 @@ import sqlite3
 from System.core.ModemService import ModemService
 from System.core.BatteryService import BatteryService
 from System.core.NotifyService import NotifyService
-from System.core.CrashHandler import show_app_crash
+from System.core.CrashHandler import show_app_crash, log_crash
 import System.ui.Dialer.call_screen as dialer_ui
 import System.ui.Dialer.incoming_screen as incoming_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
@@ -311,17 +312,8 @@ class Framebuffer:
         self.mm.seek(0)
         self.mm.write(b"\x00" * self.size)
 
-        # Reuse target buffer/image to avoid per-frame allocations.
-        self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
+        self.native_img = None
         self._black = (0, 0, 0)
-
-        # Cache RGB565 lookup tables for fallback packing.
-        # These reduce Python work inside the hot pixel loop.
-        self._r565 = [(i & 0xF8) << 8 for i in range(256)]
-        self._g565 = [(i & 0xFC) << 3 for i in range(256)]
-        self._b565 = [(i >> 3) for i in range(256)]
-        self._rgb565_out = bytearray(self.size)
-        self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
 
         # Detect the pixel conversion path ONCE (Pillow >= 11 removed the
         # "BGR;16" packer, which silently forced the slow Python loop).
@@ -340,9 +332,19 @@ class Framebuffer:
         else:
             path = "PYTHON RGB565 PACK 16bpp (SLOW -- ~350ms/frame on RV1103!)"
         print(f"[FB] {self.xres}x{self.yres} @ {self.bpp}bpp, pixel path: {path}")
+
+        # RGB565 fallback tables/buffers exist only on the 16bpp-without-
+        # "BGR;16" path; other configs don't pin ~350 KB (64 MB device).
+        self._r565 = self._g565 = self._b565 = None
+        self._rgb565_out = self._rgb565_band_out = None
         if self.bpp == 16 and not self._has_bgr16:
             print("[FB] WARNING: on hardware, ensure neodct_displayd v2.1+ runs "
                   "BEFORE the UI so the framebuffer is switched to 32bpp.")
+            self._r565 = [(i & 0xF8) << 8 for i in range(256)]
+            self._g565 = [(i & 0xFC) << 3 for i in range(256)]
+            self._b565 = [(i >> 3) for i in range(256)]
+            self._rgb565_out = bytearray(self.size)
+            self._rgb565_band_out = bytearray(self.xres * self.yres * 2)
 
     def _pack_rgb565(self, src_bytes, out_buf):
         r565 = self._r565
@@ -413,6 +415,8 @@ class Framebuffer:
                 return
 
         # Clear reusable target, then paste current frame.
+        if self.native_img is None:
+            self.native_img = Image.new("RGB", (self.stride_pixels, self.yres), "black")
         self.native_img.paste(self._black, (0, 0, self.stride_pixels, self.yres))
         self.native_img.paste(cropped, (dst_x, dst_y))
 
@@ -446,7 +450,10 @@ def init_databases():
         pb_file = f"{db_path}/phonebook.db"
         conn = sqlite3.connect(pb_file)
         c = conn.cursor()
-        
+        # WAL hardening so the database is not corrupted by a power loss mid-write.
+        # Every later connection like Phonebook and Messages uses WAL automagically!!! (hopefully)
+        c.execute("PRAGMA journal_mode=WAL")
+
         c.execute('''CREATE TABLE IF NOT EXISTS contacts
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                       name TEXT, 
@@ -466,6 +473,7 @@ def init_databases():
         inbox_file = f"{db_path}/sms_inbox.db"
         conn = sqlite3.connect(inbox_file)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute('''CREATE TABLE IF NOT EXISTS inbox
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       message TEXT,
@@ -479,6 +487,7 @@ def init_databases():
         outbox_file = f"{db_path}/sms_outbox.db"
         conn = sqlite3.connect(outbox_file)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute('''CREATE TABLE IF NOT EXISTS outbox
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       message TEXT,
@@ -700,22 +709,53 @@ class NeoDCT_UI:
             return None
             
             
-    def get_image(self, path):
+    IMAGE_CACHE_MAX = 32
+
+    def get_image(self, path, max_size=None, scale=None):
+        """Load (and cache) an RGBA image.
+
+        max_size: optional int -- downscale so neither side exceeds it and
+        cache the SCALED copy under a separate key. Callers that only ever
+        draw an icon small (AppSelector) should pass this so the cache holds
+        ~KB thumbnails instead of full-size art; on 64 MB the full-size icon
+        set alone is ~1 MB of RGBA.
+        scale: optional float -- exact-ratio resize, cached at display size
+        only (status-bar sprites via _get_status_icon).
+        """
         if path.startswith("/home"):
             if "System" in path:
-                rel_path = path.split("NeoDCT")[-1] 
+                rel_path = path.split("NeoDCT")[-1]
                 clean_path = "/NeoDCT" + rel_path
             else: clean_path = path
         else: clean_path = path
 
-        if clean_path in self.image_cache:
-            return self.image_cache[clean_path]
-        
+        if max_size is not None:
+            key = f"{clean_path}@{int(max_size)}"
+        elif scale is not None:
+            key = f"{clean_path}@x{scale:g}"
+        else:
+            key = clean_path
+        if key in self.image_cache:
+            return self.image_cache[key]
+
         try:
             img = Image.open(clean_path).convert("RGBA")
-            self.image_cache[clean_path] = img
+            if max_size is not None and (img.width > max_size or img.height > max_size):
+                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            elif scale is not None:
+                w = max(1, int(img.width * scale))
+                h = max(1, int(img.height * scale))
+                if (w, h) != img.size:
+                    img = img.resize((w, h), Image.Resampling.LANCZOS)
+            self._cache_put(key, img)
             return img
         except: return None
+
+    def _cache_put(self, key, img):
+        # FIFO cap so the cache cannot grow without bound on 64 MB.
+        if len(self.image_cache) >= self.IMAGE_CACHE_MAX:
+            self.image_cache.pop(next(iter(self.image_cache)))
+        self.image_cache[key] = img
 
     def get_text_size(self, text, font):
         bbox = self.draw.textbbox((0, 0), text, font=font)
@@ -750,8 +790,12 @@ class NeoDCT_UI:
             # Battery gauge and cell signal are live (fuel gauge / modem
             # AT+CSQ). In modem Simulation Mode signal_level() is None and
             # the layout's sim_val still applies, like before.
+            count = el.get("count", 5)
+            bat_label = None
             if el.get("prefix") == "bat":
                 val = self.battery.level()
+                if not self.battery.hardware:
+                    bat_label = "?"
             elif el.get("prefix") == "sig":
                 bars = self.modem.signal_level()
                 val = int(el.get("sim_val", 3)) if bars is None else bars
@@ -760,24 +804,43 @@ class NeoDCT_UI:
             custom_path = el.get("custom_images", {}).get(str(val))
             x = int((el["x"] / 240.0) * self.W)
             y = int((el["y"] / 240.0) * self.H)
+
+            vis_box = None
             if custom_path:
-                img = self.get_image(custom_path)
+                img = self._get_status_icon(custom_path)
                 if img:
-                    # Home layout coordinates are authored for 240px-tall UI.
-                    # Scale icon assets by height ratio so status icons don't clip on shorter displays.
-                    icon_scale = self.H / 240.0
-                    scaled_w = max(1, int(img.width * icon_scale))
-                    scaled_h = max(1, int(img.height * icon_scale))
-                    if (scaled_w, scaled_h) != img.size:
-                        img = img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
                     self.canvas.paste(img, (x, y), img)
+                    if bat_label is not None:
+                        vis_box = img.getbbox() or (0, 0, img.width, img.height)
             else:
-                for i in range(el["count"]):
+                step = max(3, int(self.W * 0.021))
+                for i in range(count):
                     h = (i + 1) * 3
                     color = "white" if i <= val else "#333333"
-                    step = max(3, int(self.W * 0.021))
                     bx = x + (i * step)
                     self.draw.rectangle((bx, y + 15 - h, bx + 3, y + 15), fill=color)
+                vis_box = (0, 0, count * step, 15)
+
+            # Draw the '?' even when the sprite failed to load, so a missing
+            # asset can't silently hide the "no battery" state.
+            if bat_label is not None:
+                self._draw_status_label(bat_label, x, y, vis_box or (0, 0, 12, 15))
+
+    def _get_status_icon(self, path):
+        """Status-bar sprite scaled by H/240 (home layout coords are authored
+        for a 240px-tall UI), cached at display size only."""
+        return self.get_image(path, scale=self.H / 240.0)
+
+    def _draw_status_label(self, text, icon_x, icon_y, vis_box):
+        """Draw a small status value (e.g. battery '85%' or '?') just left of the
+        icon's visible (opaque) region, vertically centered on it. Aligning to
+        the opaque box -- not the full sprite -- keeps it next to a battery
+        graphic that only fills the lower part of a tall image."""
+        left, top, right, bottom = vis_box
+        tw, th = self.get_text_size(text, self.font_s)
+        tx = max(0, icon_x + left - tw - 4)
+        ty = icon_y + top + max(0, ((bottom - top) - th) // 2)
+        self.draw.text((tx, ty), text, font=self.font_s, fill="white")
 
     def render_home(self):
         # 1. Background Logic
@@ -786,9 +849,16 @@ class NeoDCT_UI:
         elif self.home_layout:
             bg_path = self.home_layout.get("background")
             if bg_path:
-                bg = self.get_image(bg_path)
+                # Convert/resize once and keep the screen-sized copy;
+                # render_home runs every frame and a per-frame LANCZOS
+                # resize of a full-screen image is pure waste.
+                bg = getattr(self, "_home_bg", None)
+                if bg is None:
+                    bg = self.get_image(bg_path)
+                    if bg:
+                        bg = bg.convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
+                        self._home_bg = bg
                 if bg:
-                    bg = bg.convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
                     self.canvas.paste(bg, (0, 0))
             else:
                 self.draw.rectangle((0, 0, self.W, self.H), fill="black")
@@ -811,13 +881,9 @@ class NeoDCT_UI:
         # status strip while unread mail exists, banner while undismissed.
         if self.notify.active() or self._unread_sms > 0:
             if int(time.time() * 2) % 2 == 0:
-                env = self.get_image("/NeoDCT/System/ui/resources/img/envelope.png")
+                env = self._get_status_icon("/NeoDCT/System/ui/resources/img/envelope.png")
                 if env:
                     icon_scale = self.H / 240.0
-                    w = max(1, int(env.width * icon_scale))
-                    h = max(1, int(env.height * icon_scale))
-                    if (w, h) != env.size:
-                        env = env.resize((w, h), Image.Resampling.LANCZOS)
                     self.canvas.paste(env, (int(46 * icon_scale) + 7,
                                             int(10 * icon_scale)), env)
         if self.notify.active():
@@ -861,8 +927,9 @@ class NeoDCT_UI:
             app_name = app.get("name", "(unknown)")
             print(f"[OS] App crashed: {app_name} ({path})")
             traceback.print_exc()
-            show_app_crash(self)
+            show_app_crash(self, app_name=app_name, exc_info=sys.exc_info())
         finally:
+            gc.collect()
             # Messages may have been read (or arrived) inside the app.
             self._unread_sms = self._count_unread_sms()
 
@@ -878,6 +945,7 @@ class NeoDCT_UI:
         except BaseException:
             print("[OS] Menu crashed")
             traceback.print_exc()
+            log_crash("menu", sys.exc_info())
         finally:
             # Always unwind menu state so one bad app/menu event cannot trap the core loop.
             self.state = "HOME"
@@ -1134,6 +1202,10 @@ class NeoDCT_UI:
             # No matrix key this cycle; continue to evdev fallback if available.
 
         if self.keypad_fd is None:
+            # With no evdev device AND no matrix backend, nothing above waited,
+            # so sleep out the timeout to avoid a 100% CPU busy-loop in wait_for_key().
+            if self.matrix_input is None:
+                time.sleep(max(0.0, timeout))
             return None
 
         try:
@@ -1193,8 +1265,11 @@ class NeoDCT_UI:
                     self.state = "HOME"
 
         elif code in (103, 108) and self.state == "HOME":
-            target = contact_manager.show_contact_selector(self, title="Select", btn_text="Call")
-            if target:
+            result = contact_manager.show_contact_selector(self, title="Select", btn_text="Call")
+            if result:
+                # show_contact_selector returns (contact_row, selection_index);
+                # contact_row is (id, name, number, speed_dial).
+                target, _ = result
                 number = target[2]
                 name = target[1]
                 self.modem.dial(number)
@@ -1234,6 +1309,7 @@ def run(fb):
         except BaseException:
             print("[CORE] Unhandled exception in main loop")
             traceback.print_exc()
+            log_crash("core-main-loop", sys.exc_info())
             time.sleep(0.1)
 
 if __name__ == "__main__":

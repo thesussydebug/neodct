@@ -242,6 +242,11 @@ class KeypadMapperI2C:
             title="Keypad Mapper I2C",
         ).show()
 
+        # Suspend the UI's own input backend during capture so it cannot scan
+        # the PCF8575 at the same time as the scanner.
+        suspended_input = getattr(self.ui, "matrix_input", None)
+        self.ui.matrix_input = None
+
         try:
             self._open_scanner()
             captured = self._capture_keymap()
@@ -254,6 +259,7 @@ class KeypadMapperI2C:
             return
         finally:
             self._close_scanner()
+            self.ui.matrix_input = suspended_input
 
         MessageDialog(self.ui, f"Keymap saved to\n{OUTPUT_PATH}").show()
 

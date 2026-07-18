@@ -13,12 +13,11 @@
 tty1::once:/bin/run_neodct.sh
 
 # 3. The "Debug" Shell (Serial Port)
-# Spawn a login prompt on the serial port.
-# NOTE: Use 'ttyAMA0' for real Raspberry Pi. Use 'ttyS0' for QEMU.
-# It's safe to list both; init will just fail one silently if it doesn't exist.
-# ttyAMA0::respawn:/sbin/getty -L ttyAMA0 115200 vt100
-ttyFIQ0::respawn:/sbin/getty -L ttyFIQ0 115200 vt100
-# ttyAMA0::respawn:/sbin/getty -L ttyAMA0 115200 vt100
+# getty_guard.sh spawns getty at 115200 only if the tty exists
+# (ttyFIQ0 = Luckfox FIQ debugger, ttyAMA0 = QEMU PL011).
+# Luckfox-flavor builds replace this file with inittab.luckfox (1500000).
+::respawn:/bin/getty_guard.sh ttyFIQ0
+::respawn:/bin/getty_guard.sh ttyAMA0
 
 
 # 4. System Hooks

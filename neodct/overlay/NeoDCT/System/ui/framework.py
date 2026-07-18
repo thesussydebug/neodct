@@ -81,21 +81,20 @@ class AppSelector:
         icon_y = header_y + max(24, int((content_bottom - header_y) * 0.22))
         if icon_path:
             icon_cap = min(APP_SELECTOR_ICON_MAX, max(24, content_bottom - icon_y - 8))
-            img = self.ui.get_image(icon_path)
+            # Ask for the icon pre-scaled to display size: the cache then holds
+            # a small thumbnail instead of the full-size art (the full icon set
+            # is ~1 MB of RGBA on a 64 MB device), and no copy/thumbnail work
+            # happens per frame. Falls back for UIs without the max_size param.
+            try:
+                img = self.ui.get_image(icon_path, max_size=icon_cap)
+            except TypeError:
+                img = self.ui.get_image(icon_path)
             if img:
-                draw_img = img
-                if img.width > icon_cap or img.height > icon_cap:
-                    draw_img = img.copy()
-                    draw_img.thumbnail((icon_cap, icon_cap))
-
-                ix = (screen_w - draw_img.width) // 2
+                ix = (screen_w - img.width) // 2
                 iy = icon_y
-                # If we have a background, we need to paste the icon using its alpha mask
-                # otherwise transparent pixels will be black if 'img' is just RGB
-                if self.background:
-                    self.ui.canvas.paste(draw_img, (ix, iy), draw_img)
-                else:
-                    self.ui.canvas.paste(draw_img, (ix, iy), draw_img)
+                # Paste with the icon's own alpha so transparent pixels don't
+                # go black over a background.
+                self.ui.canvas.paste(img, (ix, iy), img)
             else:
                 placeholder_size = icon_cap
                 px = (screen_w - placeholder_size) // 2
@@ -149,22 +148,29 @@ class AppSelector:
                     except: pass
                 else: break 
 
-        self.draw() 
-        
+        self.draw()
+
         while True:
             key = self.ui.wait_for_key()
-            
+
+            # Empty list (e.g. app scan failed): navigation would divide by
+            # zero and Enter would index past the end, so only allow backing out.
+            if not self.items:
+                if key in (14, 28):
+                    return -1
+                continue
+
             if key == 108: # DOWN (Next App)
                 self.selected_index = (self.selected_index + 1) % len(self.items)
-                self.draw() 
-                        
+                self.draw()
+
             elif key == 103: # UP (Previous App)
                 self.selected_index = (self.selected_index - 1) % len(self.items)
-                self.draw() 
-                        
+                self.draw()
+
             elif key == 28: # ENTER Only (Legacy '50' Removed)
-                return self.selected_index 
-            
+                return self.selected_index
+
             elif key == 14: # BACKSPACE Only (Legacy '46' Removed)
                 return -1
 

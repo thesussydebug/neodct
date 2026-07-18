@@ -18,7 +18,12 @@ def register_all(eng):
     # ---- playability tuning (sanctioned deviations from the 1:1 port) ----
     # ATK > 1 slows attacks down; IFRAMES = post-hit invincibility seconds.
     import os as _os
-    ATK = float(_os.environ.get("NEODCT_KOKI_ATTACK_SLOW", "1.35"))
+    try:
+        ATK = float(_os.environ.get("NEODCT_KOKI_ATTACK_SLOW", "1.35"))
+    except ValueError:
+        ATK = 1.35
+    if not (ATK > 0):   # rejects 0 (div-by-zero at 20/ATK), negatives, NaN
+        ATK = 1.35
     IFRAMES = 0.9
 
     # ---- global variables ("when flag clicked" defaults) -------------------
@@ -429,8 +434,8 @@ def register_all(eng):
                 PLAYER.sy = 17 if (PLAYER.sy < 1 and key("z")) else 0
             yield
 
-    for _msg in ("turn anim", "oofie", "disableplayer", "final cutscene",
-                 "ending cutscene", "stopmusic"):
+    for _msg in ("turn anim", "oofie", "falloofie", "disableplayer",
+                 "final cutscene", "ending cutscene", "stopmusic"):
         @eng.on(_msg, PLAYER)
         def _player_off():
             eng.stop_other_scripts(PLAYER)
@@ -1448,6 +1453,17 @@ def register_all(eng):
         CBALL.hide()
         return
         yield
+
+    # Kill any in-flight ball when the player dies: otherwise its damage
+    # broadcast lands ~0.7 s later, restarting the boss over the corpse
+    # (or granting door progression on a death).
+    for _msg in ("oofie", "planeoofie", "falloofie"):
+        @eng.on(_msg, CBALL)
+        def _cball_playerdead():
+            eng.stop_other_scripts(CBALL)
+            CBALL.hide()
+            return
+            yield
 
     # -- QuickPress prompt ------------------------------------------------------
     @eng.on("quick tap", QUICK)
@@ -2487,6 +2503,11 @@ def register_all(eng):
             RIBY.set_costume("costume2")
             yield from W(2)
             _danger(1)
+        # Every other attack pattern chains into the next by broadcasting;
+        # without this the fight soft-locks (Riby inert, player can neither
+        # damage him nor die) if the player missed all the pound windows.
+        yield from W(1)
+        eng.broadcast("jumpatkriby")
 
     @eng.on("RibyOUT", RIBY)
     def _riby_out():
