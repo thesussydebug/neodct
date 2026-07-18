@@ -488,3 +488,27 @@ ship (uclibc has no usable iconv either). Define WITHOUT_ICONV_FILTER via
 libparserutils/Makefile.config.override so the builtin charset codecs are
 used. Verified in QEMU: https://example.com typed into the URL bar over
 virtio-keyboard renders correctly on the framebuffer.
+
+--- netsurf-neodct: NeoDCT-styled chrome, font, mem log, exit fix ---
+netsurf@real-browser-tests: framework-faithful chrome + Nokia font
+
+- Overlay screens redrawn to replicate framework.py exactly, in one
+  imperatively-drawn full-screen widget: VerticalList Options menu
+  (font_xl title, 11-N breadcrumb, white selection box, gray scrollbar
+  with notch), TextInput "Go to URL" (prompt, outlined box, blinking
+  cursor, tail-scroll clip), TextInputLong "Input Text" (char count,
+  font_s greedy word wrap - TDD'd neodct_wrap), SoftKeyBar (30px,
+  centred font_n, only over menus/inputs)
+- freetype fontlib with the NeoDCT font for all faces (option defaults
+  point at /NeoDCT/System/ui/resources/fonts/font.ttf; NEODCT_FONT env
+  overrides for host dev); page content renders in the phone font too
+- neodct-mem: rss/hwm from /proc/self/status (TDD'd parser) printed to
+  stderr every 5s -> serial console (~13.4MB RSS on target with
+  example.com loaded)
+
+buildroot: netsurf fb build switches to freetype fontlib (+freetype dep)
+
+overlay Browser app: drain queued keypresses on exit (TDD'd, 4 pytest
+cases) - keypad fd backlog + i2c scanner pending queue made the UI
+replay stale presses as random menu actions after the browser closed;
+browser stderr now goes to /dev/console for the mem log

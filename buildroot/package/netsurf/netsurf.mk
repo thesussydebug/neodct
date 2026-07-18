@@ -102,9 +102,10 @@ endif
 # default iconv input filter makes every non-identity charset fail
 # with BadEncoding.
 ifeq ($(BR2_PACKAGE_NETSURF_FRAMEBUFFER),y)
+NETSURF_DEPENDENCIES += freetype
 define NETSURF_NEODCT_CONFIGURE_CMDS
 	echo "override NETSURF_FB_FRONTEND := linux"    >> $(@D)/netsurf/Makefile.config
-	echo "override NETSURF_FB_FONTLIB := internal"  >> $(@D)/netsurf/Makefile.config
+	echo "override NETSURF_FB_FONTLIB := freetype"  >> $(@D)/netsurf/Makefile.config
 	echo "override NETSURF_USE_DUKTAPE := NO"       >> $(@D)/netsurf/Makefile.config
 	echo "CFLAGS += -DWITHOUT_ICONV_FILTER"         >> $(@D)/libparserutils/Makefile.config.override
 endef

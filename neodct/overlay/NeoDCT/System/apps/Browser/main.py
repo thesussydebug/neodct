@@ -5,7 +5,14 @@
 # hardware the presses are bridged to a uinput keyboard the same way
 # LinuxShell does it. The launcher resumes drawing when we return.
 import os
+import select
 import subprocess
+
+HOME_PAGE = "file:///NeoDCT/System/apps/Browser/home.html"
+
+# browser stderr (incl. periodic "neodct-mem:" RSS lines) goes to the
+# serial console so memory pressure can be watched from the host
+CONSOLE = "/dev/console"
 
 
 def _start_key_bridge(ui):
@@ -19,7 +26,30 @@ def _start_key_bridge(ui):
         return None
 
 
-HOME_PAGE = "file:///NeoDCT/System/apps/Browser/home.html"
+def _drain_input(ui):
+    """Swallow every keypress queued up while the browser owned the
+    screen, so the launcher doesn't replay them as menu actions.
+
+    The keypad evdev fd keeps receiving events even while netsurf reads
+    the same device through its own fd, and the i2c scanner queues
+    presses in _pending; both must be empty before the UI resumes."""
+    fd = getattr(ui, "keypad_fd", None)
+    if fd is not None:
+        try:
+            while select.select([fd], [], [], 0)[0]:
+                if not os.read(fd, 4096):
+                    break
+        except OSError:
+            pass
+
+    matrix = getattr(ui, "matrix_input", None)
+    if matrix is not None:
+        try:
+            for _ in range(64):
+                if matrix.read_key(0) is None:
+                    break
+        except Exception:
+            pass
 
 
 def run(ui):
@@ -33,13 +63,26 @@ def run(ui):
     env.setdefault("HOME", "/NeoDCT/User")
 
     try:
-        subprocess.run(
-            [browser, HOME_PAGE],
-            env=env,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        stderr = subprocess.DEVNULL
+        try:
+            stderr = open(CONSOLE, "wb", buffering=0)
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(
+                [browser, HOME_PAGE],
+                env=env,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+            )
+        finally:
+            if stderr is not subprocess.DEVNULL:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -50,6 +93,8 @@ def run(ui):
                 bridge.stop()
             except Exception:
                 pass
+
+        _drain_input(ui)
 
         # Repaint the UI over whatever the browser left on the fb.
         try:
