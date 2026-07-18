@@ -63,7 +63,7 @@ def run(ui):
         # --- SEARCH ---
         elif selection == 0:
             # 1. Ask what to find
-            search_input = TextInput(ui, "Search", "Name:")
+            search_input = TextInput(ui, "Search", "Name:", input_filter="letters")
             query = search_input.show()
             
             if query:
@@ -109,11 +109,11 @@ def run(ui):
 # --- ACTION HELPERS (Reusable logic) ---
 
 def add_entry_action(ui):
-    name_input = TextInput(ui, "Add Entry", "Name:")
+    name_input = TextInput(ui, "Add Entry", "Name:", input_filter="letters")
     name = name_input.show()
     if not name: return
 
-    num_input = TextInput(ui, "Add Entry", "Number:")
+    num_input = TextInput(ui, "Add Entry", "Number:", input_filter="numbers")
     number = num_input.show()
     if not number: return
 
@@ -131,11 +131,13 @@ def add_entry_action(ui):
 def edit_contact_action(ui, contact):
     contact_id, current_name, current_number = contact[0], contact[1], contact[2]
     
-    name_input = TextInput(ui, "Edit Name", "Name:", initial_text=current_name)
+    name_input = TextInput(ui, "Edit Name", "Name:", initial_text=current_name,
+                           input_filter="letters")
     new_name = name_input.show()
     if new_name is None: return
 
-    num_input = TextInput(ui, "Edit Number", "Number:", initial_text=current_number)
+    num_input = TextInput(ui, "Edit Number", "Number:", initial_text=current_number,
+                          input_filter="numbers")
     new_number = num_input.show()
     if new_number is None: return
 

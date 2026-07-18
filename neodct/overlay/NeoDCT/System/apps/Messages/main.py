@@ -179,7 +179,12 @@ def _save_outbox_message(text):
 
 class ContactNumberInput(TextInput):
     """TextInput plus PhoneBook: any arrow key opens the shared contact
-    selector and autofills the picked contact's number."""
+    selector and autofills the picked contact's number. Numbers-only, so
+    the keypad types digits/star/hash literally (no T9 multi-tap)."""
+
+    def __init__(self, ui, title, prompt, initial_text=""):
+        super().__init__(ui, title, prompt, initial_text,
+                         input_filter="numbers")
 
     def show(self):
         softkey = SoftKeyBar(self.ui)
@@ -198,15 +203,7 @@ class ContactNumberInput(TextInput):
             if key is None:
                 continue
 
-            if key in (28, 96):
-                return self.text
-            if key == 14:
-                if self.text:
-                    self.text = self.text[:-1]
-                    self.draw(cursor_on)
-                else:
-                    return None
-            elif key in ARROW_KEYS:
+            if key in ARROW_KEYS:
                 picked = contact_manager.show_contact_selector(
                     self.ui, title="Contacts", btn_text="OK",
                     header_root=f"{ROOT_ID_MESSAGES}-3")
@@ -215,8 +212,14 @@ class ContactNumberInput(TextInput):
                     self.text = str(contact[2])
                 self.draw(cursor_on)
                 softkey.update("OK")
-            elif key in self.DEV_KEYMAP:
-                self.text += self.DEV_KEYMAP[key]
+                continue
+
+            action = self.handle_key(key)
+            if action == "confirm":
+                return self.text
+            if action == "cancel":
+                return None
+            if action in ("typed", "backspace", "mode"):
                 self.draw(cursor_on)
 
 

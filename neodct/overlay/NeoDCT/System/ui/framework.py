@@ -5,6 +5,14 @@ import os
 import math
 import time
 
+from System.hw import t9_engine
+
+
+def _t9_active(ui):
+    """T9 multi-tap runs only on the real i2c keypad; a dev keyboard
+    (QEMU) has full QWERTY so the DEV_KEYMAP path is used instead."""
+    return getattr(ui, "matrix_input", None) is not None
+
 DEFAULT_UI_W = 240
 DEFAULT_UI_H = 175
 DEFAULT_SOFTKEY_H = 30
@@ -364,12 +372,15 @@ TextInput is a basic text form to allow for short inputs like a phone number, na
 
 """
 class TextInput:
-    def __init__(self, ui, title, prompt, initial_text=""):
+    def __init__(self, ui, title, prompt, initial_text="", input_filter="any"):
         self.ui = ui
         self.title = title   # Header Title (e.g. "Add Entry")
         self.prompt = prompt # Instruction (e.g. "Name:")
         self.text = initial_text
-        
+        # "any" / "letters" / "numbers" -- what the field accepts
+        self.input_filter = input_filter
+        self.t9 = t9_engine.T9Engine(input_filter=input_filter)
+
         # Development Key Map (PC Keyboard -> Char)
         self.DEV_KEYMAP = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 
@@ -396,7 +407,14 @@ class TextInput:
         # 3. Prompt
         prompt_y = header_y + 20
         self.ui.draw.text((10, prompt_y), self.prompt, font=self.ui.font_n, fill="white")
-        
+
+        # 3b. T9 mode indicator ("abc"/"ABC"/"123"), right of the prompt
+        if _t9_active(self.ui):
+            label = self.t9.mode
+            w = self.ui.get_text_size(label, self.ui.font_n)[0]
+            self.ui.draw.text((screen_w - 12 - w, prompt_y), label,
+                              font=self.ui.font_n, fill="white")
+
         # 4. Input Box Container
         box_y = prompt_y + 30
         box_h = max(24, min(40, content_bottom - box_y - 10))
@@ -411,44 +429,72 @@ class TextInput:
         
         self.ui.fb.update(self.ui.canvas)
 
+    def handle_key(self, key):
+        """Apply one keycode to the field (no drawing).
+        Returns "confirm", "cancel", "typed", "backspace", "mode", or None."""
+        # ENTER / NAVI-CENTER -> Confirm (Legacy '50' Removed)
+        if key in (28, 96):
+            return "confirm"
+
+        # BACKSPACE / C BUTTON
+        if key == 14:
+            self.t9.reset()
+            if len(self.text) > 0:
+                self.text = self.text[:-1]
+                return "backspace"
+            return "cancel"
+
+        # TYPING -- T9 multi-tap on the i2c keypad
+        if _t9_active(self.ui):
+            op = self.t9.press(key)
+            if op is None:
+                return None
+            kind, value = op
+            if kind == "append":
+                self.text += value
+                return "typed"
+            if kind == "replace":
+                self.text = self.text[:-1] + value
+                return "typed"
+            if kind == "mode":
+                return "mode"
+            return None
+
+        # TYPING -- dev keyboard (QWERTY)
+        char = self.DEV_KEYMAP.get(key)
+        if char is None or not t9_engine.char_allowed(char, self.input_filter):
+            return None
+        if len(self.text) == 0: char = char.upper()
+        self.text += char
+        return "typed"
+
     def show(self):
         """ Blocking Loop. Returns STRING if confirmed, NONE if cancelled. """
         from System.ui.framework import SoftKeyBar # Local import to avoid circular dep
         softkey = SoftKeyBar(self.ui)
         softkey.update("OK")
-        
+
         cursor_on = True
         last_blink = time.time()
         self.draw(cursor_on)
-        
+
         while True:
             # --- Blink Logic ---
             if time.time() - last_blink > 0.5:
                 cursor_on = not cursor_on
                 last_blink = time.time()
                 self.draw(cursor_on)
-            
+
             # --- Input ---
-            key = self.ui.wait_for_key() 
+            key = self.ui.wait_for_key()
             if key is None: continue
 
-            # ENTER / NAVI-CENTER -> Confirm (Legacy '50' Removed)
-            if key in (28, 96): 
+            action = self.handle_key(key)
+            if action == "confirm":
                 return self.text
-
-            # BACKSPACE / C BUTTON
-            elif key == 14:
-                if len(self.text) > 0:
-                    self.text = self.text[:-1]
-                    self.draw(cursor_on)
-                else:
-                    return None
-            
-            # TYPING
-            elif key in self.DEV_KEYMAP:
-                char = self.DEV_KEYMAP[key]
-                if len(self.text) == 0: char = char.upper()
-                self.text += char
+            if action == "cancel":
+                return None
+            if action in ("typed", "backspace", "mode"):
                 self.draw(cursor_on)
 
 """
@@ -457,12 +503,16 @@ TextInputLong is a long-form text entry widget for composing messages and notes.
 
 """
 class TextInputLong:
-    def __init__(self, ui, title, initial_text="", on_empty_backspace=None):
+    def __init__(self, ui, title, initial_text="", on_empty_backspace=None,
+                 input_filter="any"):
         self.ui = ui
         self.title = title
         self.text = initial_text or ""
         self.cursor = len(self.text)
         self.on_empty_backspace = on_empty_backspace
+        # "any" / "letters" / "numbers" -- what the field accepts
+        self.input_filter = input_filter
+        self.t9 = t9_engine.T9Engine(input_filter=input_filter)
         self.font = getattr(ui, "font_s", None) or ui.font_n
         self.text_area_top = _header_divider_y(ui) + 10
         self.text_area_bottom = _content_bottom(ui) - 4
@@ -554,6 +604,12 @@ class TextInputLong:
         char_count = str(len(self.text))
         w, _ = self.ui.get_text_size(char_count, self.ui.font_n)
         self.ui.draw.text((screen_w - 5 - w, 5), char_count, font=self.ui.font_n, fill="white")
+        # T9 mode indicator ("abc"/"ABC"/"123"), left of the char count
+        if _t9_active(self.ui):
+            label = self.t9.mode
+            lw, _ = self.ui.get_text_size(label, self.ui.font_n)
+            self.ui.draw.text((screen_w - 5 - w - 10 - lw, 5), label,
+                              font=self.ui.font_n, fill="white")
         self.ui.draw.line((0, header_y, screen_w, header_y), fill="white")
 
         lines = self._current_lines(blink_state)
@@ -571,18 +627,41 @@ class TextInputLong:
 
     def handle_key(self, key):
         if key == 14: # Backspace
+            self.t9.reset()
             if len(self.text) == 0:
                 if callable(self.on_empty_backspace):
                     self.on_empty_backspace()
                 return "empty_backspace"
-            
+
             if self.cursor > 0:
                 self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
                 self.cursor = max(0, self.cursor - 1)
             return "backspace"
 
+        # T9 multi-tap on the i2c keypad
+        if _t9_active(self.ui):
+            op = self.t9.press(key)
+            if op is None:
+                return None
+            kind, value = op
+            if kind == "append":
+                self.text = self.text[:self.cursor] + value + self.text[self.cursor:]
+                self.cursor += 1
+                return "typed"
+            if kind == "replace":
+                if self.cursor > 0:
+                    self.text = (self.text[:self.cursor - 1] + value
+                                 + self.text[self.cursor:])
+                return "typed"
+            if kind == "mode":
+                return "mode"
+            return None
+
+        # Dev keyboard (QWERTY)
         if key in self.DEV_KEYMAP:
             char = self.DEV_KEYMAP[key]
+            if not t9_engine.char_allowed(char, self.input_filter):
+                return None
             # Simple capitalization logic for start of message
             if len(self.text) == 0:
                 char = char.upper()

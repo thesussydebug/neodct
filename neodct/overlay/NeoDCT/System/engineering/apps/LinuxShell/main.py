@@ -33,6 +33,18 @@ def _write_tty(tty_path: str, data: bytes) -> None:
         pass
 
 
+def _start_t9_bridge(ui):
+    """Keypad-only hardware: mirror i2c keypad presses into the console
+    via a T9 uinput keyboard. Returns None on QEMU/dev (real keyboard
+    present) or when uinput is unavailable -- the shell still works,
+    just without on-device typing."""
+    try:
+        from System.hw.t9_uinput import start_shell_bridge
+        return start_shell_bridge(ui)
+    except Exception:
+        return None
+
+
 def run(ui):
     """
     Raw console shell on a real /dev/ttyN, shown on-device.
@@ -66,6 +78,13 @@ def run(ui):
     _write_tty(tty_shell, b"\x1b[?25h")  # cursor on
     _write_tty(tty_shell, b"Type exit to go back to the NeoDCT UI\r\n\r\n")
 
+    # On keypad hardware, type into the console via T9 (multi-tap letters,
+    # # cycles abc/ABC/123). Only alive while the shell runs.
+    bridge = _start_t9_bridge(ui)
+    if bridge is not None:
+        _write_tty(tty_shell, b"T9 keypad active: 2-9 letters, 0 space, "
+                              b"1 symbols, # mode, C backspace\r\n\r\n")
+
     # Run interactive shell attached to the real tty
     try:
         with open(tty_shell, "r+b", buffering=0) as t:
@@ -81,6 +100,14 @@ def run(ui):
     except Exception:
         pass
     finally:
+        # Tear down the virtual keyboard before the UI resumes reading
+        # the keypad, so nothing double-consumes presses.
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+
         # Hide cursor again (your cmdline has vt.global_cursor_default=0)
         _write_tty(tty_shell, b"\x1b[?25l")  # cursor off
 
