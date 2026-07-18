@@ -398,3 +398,93 @@ issue banner in build-luckfox/.config ships again.
 
 py_compile clean on all six touched .py files; historical 0.2.4a
 references in BatteryService's docstring left alone on purpose.
+
+---
+
+Add T9 multi-tap typing: UI framework + LinuxShell console driver
+
+Shared engine (System/hw/t9_engine.py, pure logic, no I/O): NeoDCT
+keycodes in, edit ops out (append/replace/mode). Modes abc/ABC/123
+cycled with #; 2-9 multi-tap letters, 1 punctuation, 0 space, digit at
+end of each cycle. Input filters: any / letters / numbers (numbers =
+literal digits + * # for phone fields, no mode switching).
+
+UI side (framework.py): TextInput and TextInputLong take
+input_filter=, expose handle_key(), and draw an abc/ABC/123 indicator.
+T9 runs only when ui.matrix_input (i2c keypad) exists; QEMU/dev
+QWERTY path unchanged but now respects the filter. PhoneBook name
+fields are letters-only, number fields numbers-only;  Messages
+ContactNumberInput is numbers-only and now types * / # on the keypad.
+
+LinuxShell side (System/hw/t9_uinput.py): virtual keyboard via
+/dev/uinput (pure stdlib struct/ioctl, 32-bit-safe input_event
+packing) + T9ShellBridge thread that polls ui.matrix_input and
+injects console key events; multi-tap cycling sends backspace+char,
+enter/clear/arrows pass through (NeoDCT codes ARE Linux keycodes).
+Created when LinuxShell opens on keypad hardware, destroyed on exit
+(UI_DEV_DESTROY) -- never alive while the UI owns the keypad, absent
+on QEMU where a real keyboard exists.
+
+Kernel: CONFIG_INPUT_MISC + CONFIG_INPUT_UINPUT added to the shared
+board/qemu/aarch64-virt/linux.config (all three flavors use it;
+without uinput the shell still works, bridge just stays off).
+
+Tests: neodct/tests/ host-side pytest suite (68 tests, TDD:
+engine, widget handle_key paths, uinput event bytes via pipe fd,
+bridge lifecycle, LinuxShell wiring). Not shipped: overlay prune
+only covers overlay/tests, and neodct/tests sits outside the overlay.
+
+--- netsurf-neodct: NeoDCT browser port (branches: netsurf@neodct, libnsfb@neodct) ---
+netsurf: port old WebKit browser UI onto netsurf 3.11 framebuffer frontend
+
+- Pin netsurf checkout to release/3.11 (matches host system component libs)
+- New frontends/framebuffer/neodct/: TDD'd chrome logic (128 checks green:
+  neodct_url, neodct_menu, neodct_cursor, neodct_ui state machine,
+  neodct_status) + neodct_shell.c fbtk chrome (URL bar, status bar,
+  softkey bar, Options menu, Input Text popup, keypad cursor)
+- gui.c: NeoDCT window creation, key routing through neodct shell,
+  240x175 default, NULL-furniture guards, hover/status/url hooks
+- Dev harness: NEODCT_SCRIPT env drives scripted input + PPM screenshots
+  headlessly on the ram surface (unit tests: make -C frontends/framebuffer/neodct/test)
+
+libnsfb: restore Linux framebuffer surface, drop windowed deps
+
+- Restore src/surface/linux.c (removed upstream in b2bb565, pre-0.2.2);
+  compiles clean against current surface API, gated by NSFB_LINUX_AVAILABLE
+- Build with only linux+ram surfaces (no SDL/X/VNC/wayland)
+
+--- netsurf-neodct: QEMU/buildroot integration ---
+libnsfb@neodct: add evdev keyboard input to linux surface
+
+- New src/surface/linux_evdev.c: evdev keycode -> nsfb keycode table
+  (TDD: test/evdev.c wired into libnsfb test harness)
+- linux.c: open /dev/input/event* keyboards at init (NSFB_INPUT_DEV
+  env overrides), poll()-based input() honouring timeout, autorepeat
+  as key-down; no more busy-looping stub
+
+buildroot: netsurf 3.11 + NeoDCT sources, enable for QEMU aarch64
+
+- package/netsurf: bump to netsurf-all-3.11, POST_EXTRACT hook rsyncs
+  local netsurf-neodct/{netsurf,libnsfb} neodct branches over bundled
+  trees; framebuffer build uses linux surface, internal font, no JS;
+  drop obsolete patches (0001/0003/0004) and stale libnsfb pkg dep;
+  framebuffer is now a proper frontend choice in Config.in
+- configs/neodct_qemu_defconfig: resync from live .config (was stale:
+  v0.2.1a vs live v0.2.3a) + add libcurl, netsurf, netsurf-framebuffer
+- overlay: new apps/Browser (id 11) launching /usr/bin/netsurf-fb with
+  LinuxShell-style takeover + t9_uinput bridge on keypad hardware;
+  home.html ported from the old WebKit browser homepage
+- verified in headless QEMU (monitor sendkey/screendump): chrome, menu,
+  typing, cursor + real evdev input on fbdev; https fetch works (curl
+  200 on example.com)
+
+--- netsurf-neodct: fix BadEncoding on target ---
+buildroot/netsurf: build libparserutils without the iconv filter
+
+Pages with no declared charset (HTML5 Windows-1252 fallback) failed with
+about:query/fetcherror "BadEncoding": libparserutils' default iconv input
+filter needs glibc gconv modules that the purged target rootfs doesn't
+ship (uclibc has no usable iconv either). Define WITHOUT_ICONV_FILTER via
+libparserutils/Makefile.config.override so the builtin charset codecs are
+used. Verified in QEMU: https://example.com typed into the URL bar over
+virtio-keyboard renders correctly on the framebuffer.

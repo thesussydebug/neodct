@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-NETSURF_VERSION = 3.10
+NETSURF_VERSION = 3.11
 NETSURF_SOURCE = netsurf-all-$(NETSURF_VERSION).tar.gz
 NETSURF_SITE = http://download.netsurf-browser.org/netsurf/releases/source-full
 NETSURF_LICENSE = GPL-2.0
@@ -13,6 +13,21 @@ NETSURF_CPE_ID_VENDOR = netsurf-browser
 # host-vim needed for the xxd utility
 NETSURF_DEPENDENCIES = expat jpeg libpng \
 	host-bison host-flex host-gperf host-pkgconf host-vim
+
+# NeoDCT: replace the bundled netsurf and libnsfb with the local
+# neodct-branch trees (NeoDCT chrome + restored linux fbdev surface
+# with evdev input). The rest of the bundle provides the component
+# libraries at 3.11-matched versions.
+NETSURF_NEODCT_DIR = $(TOPDIR)/../netsurf-neodct
+
+define NETSURF_NEODCT_SOURCES
+	rm -rf $(@D)/netsurf $(@D)/libnsfb
+	rsync -a --exclude=.git --exclude='build*' --exclude=nsfb \
+		$(NETSURF_NEODCT_DIR)/netsurf/ $(@D)/netsurf/
+	rsync -a --exclude=.git --exclude='build*' \
+		$(NETSURF_NEODCT_DIR)/libnsfb/ $(@D)/libnsfb/
+endef
+NETSURF_POST_EXTRACT_HOOKS += NETSURF_NEODCT_SOURCES
 
 # internal duktape doesn't build with BR2_OPTIMIZE_FAST
 ifeq ($(BR2_OPTIMIZE_FAST),y)
@@ -80,6 +95,21 @@ define NETSURF_WEBP_CONFIGURE_CMDS
 endef
 endif
 
+# NeoDCT framebuffer frontend: linux fbdev surface from the bundled
+# (replaced) libnsfb, internal font, no JS (64MB RAM target).
+# libparserutils must use its builtin charset codecs: the target has
+# no glibc gconv modules (and uclibc has no usable iconv), so the
+# default iconv input filter makes every non-identity charset fail
+# with BadEncoding.
+ifeq ($(BR2_PACKAGE_NETSURF_FRAMEBUFFER),y)
+define NETSURF_NEODCT_CONFIGURE_CMDS
+	echo "override NETSURF_FB_FRONTEND := linux"    >> $(@D)/netsurf/Makefile.config
+	echo "override NETSURF_FB_FONTLIB := internal"  >> $(@D)/netsurf/Makefile.config
+	echo "override NETSURF_USE_DUKTAPE := NO"       >> $(@D)/netsurf/Makefile.config
+	echo "CFLAGS += -DWITHOUT_ICONV_FILTER"         >> $(@D)/libparserutils/Makefile.config.override
+endef
+endif
+
 define NETSURF_CONFIGURE_CMDS
 	$(NETSURF_DUKTAPE_CONFIGURE_CMDS)
 	$(NETSURF_ICONV_CONFIGURE_CMDS)
@@ -87,6 +117,7 @@ define NETSURF_CONFIGURE_CMDS
 	$(NETSURF_FONTLIB_CONFIGURE_CMDS)
 	$(NETSURF_CURL_CONFIGURE_CMDS)
 	$(NETSURF_WEBP_CONFIGURE_CMDS)
+	$(NETSURF_NEODCT_CONFIGURE_CMDS)
 endef
 
 NETSURF_MAKE_ENV = \
@@ -117,17 +148,10 @@ define NETSURF_INSTALL_TARGET_CMDS
 		DESTDIR=$(TARGET_DIR) install
 endef
 
-# --- FORCE USE FRAMEBUFFER INSTEAD OF SDL ---
+# NeoDCT native framebuffer frontend (libnsfb bundled in netsurf-all,
+# replaced with the neodct branch by NETSURF_NEODCT_SOURCES above)
 ifeq ($(BR2_PACKAGE_NETSURF_FRAMEBUFFER),y)
-NETSURF_DEPENDENCIES := $(filter-out sdl,$(NETSURF_DEPENDENCIES))
-NETSURF_DEPENDENCIES += libnsfb
 NETSURF_FRONTEND = framebuffer
 endif
-# ----------------------------------
 
 $(eval $(generic-package))
-
-ifeq ($(BR2_PACKAGE_NETSURF_FRAMEBUFFER),y)
-NETSURF_DEPENDENCIES += libnsfb
-NETSURF_FRONTEND = framebuffer
-endif

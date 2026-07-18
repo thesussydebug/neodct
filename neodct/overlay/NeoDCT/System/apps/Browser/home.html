@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>NeoDCT Web</title>
+    <meta charset="utf-8">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: #000000;
+            color: #FFFFFF;
+            font-family: monospace;
+            margin: 0;
+            padding: 0;
+        }
+
+        header {
+            width: 100%;
+            text-align: center;
+            padding-top: 6px;
+            padding-bottom: 4px;
+            border-bottom: 2px solid #FFFFFF;
+            margin-bottom: 6px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: bold;
+            letter-spacing: 1px;
+            line-height: 1;
+        }
+
+        .subtitle {
+            font-size: 8px;
+            color: #AAAAAA;
+            margin-top: 2px;
+        }
+
+        .search-container {
+            width: 224px;
+            margin: 0 auto 8px auto;
+        }
+
+        input[type="text"] {
+            background-color: #000;
+            color: #FFF;
+            border: 2px solid #FFF;
+            border-right: none;
+            height: 26px;
+            width: 190px;
+            padding: 0 4px;
+            font-family: inherit;
+            font-size: 12px;
+            border-radius: 0;
+        }
+
+        button[type="submit"] {
+            background-color: #FFF;
+            color: #000;
+            border: 2px solid #FFF;
+            height: 26px;
+            width: 26px;
+            padding: 0;
+            font-weight: bold;
+            font-size: 14px;
+            line-height: 1;
+            border-radius: 0;
+        }
+
+        .app-grid {
+            width: 224px;
+            margin: 0 auto;
+        }
+
+        a.app-icon {
+            display: inline-block;
+            background-color: #000;
+            border: 2px solid #FFF;
+            color: #FFF;
+            text-decoration: none;
+            width: 70px;
+            height: 40px;
+            text-align: center;
+            padding-top: 12px;
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>NeoDCT Web</h1>
+        <div class="subtitle">powered by netsurf</div>
+    </header>
+
+    <div class="search-container">
+        <form action="https://html.duckduckgo.com/html/" method="GET">
+            <input type="text" name="q">
+            <button type="submit">&gt;</button>
+        </form>
+    </div>
+
+    <div class="app-grid">
+        <a href="https://weather.gov" class="app-icon">Weather</a>
+        <a href="https://lite.cnn.com" class="app-icon">News</a>
+        <a href="https://en.m.wikipedia.org" class="app-icon">Wiki</a>
+    </div>
+
+</body>
+</html>
