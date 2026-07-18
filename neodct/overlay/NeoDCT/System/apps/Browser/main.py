@@ -14,6 +14,45 @@ HOME_PAGE = "file:///NeoDCT/System/apps/Browser/home.html"
 # serial console so memory pressure can be watched from the host
 CONSOLE = "/dev/console"
 
+_SIGNAL_NOTES = {
+    6: "SIGABRT",
+    9: "SIGKILL, possible OOM",
+    11: "SIGSEGV",
+}
+
+
+def _describe_exit(returncode):
+    """One serial-log line describing how netsurf-fb ended."""
+    if returncode == 0:
+        return "neodct-browser: exited normally"
+    if returncode > 0:
+        return "neodct-browser: exited with code %d" % returncode
+    sig = -returncode
+    note = _SIGNAL_NOTES.get(sig)
+    if note is not None:
+        return "neodct-browser: KILLED by signal %d (%s)" % (sig, note)
+    return "neodct-browser: KILLED by signal %d" % sig
+
+
+def _log_console(text):
+    try:
+        with open(CONSOLE, "wb", buffering=0) as f:
+            f.write(text.encode() + b"\r\n")
+    except Exception:
+        pass
+
+
+def _dump_dmesg_tail(lines=15):
+    """After an abnormal exit, surface the kernel's view (OOM killer
+    reports land in dmesg even with a quiet console)."""
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True,
+                             timeout=5).stdout
+        for line in out.splitlines()[-lines:]:
+            _log_console(line.decode(errors="replace"))
+    except Exception:
+        pass
+
 
 def _start_key_bridge(ui):
     """Keypad-only hardware: mirror i2c keypad presses into a uinput
@@ -70,13 +109,16 @@ def run(ui):
             pass
 
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [browser, HOME_PAGE],
                 env=env,
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
             )
+            _log_console(_describe_exit(proc.returncode))
+            if proc.returncode < 0:
+                _dump_dmesg_tail()
         finally:
             if stderr is not subprocess.DEVNULL:
                 try:

@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# zram swap: compressed-memory headroom so heavy pages (browser)
+# get squeezed instead of OOM-killed. Sized to half of RAM.
+
+case "$1" in
+    start)
+        [ -b /dev/zram0 ] || modprobe zram 2>/dev/null
+        [ -b /dev/zram0 ] || exit 0
+        grep -q zram0 /proc/swaps && exit 0
+
+        SIZE=$(awk '/MemTotal/{print int($2/2)"K"}' /proc/meminfo)
+        echo "$SIZE" > /sys/block/zram0/disksize || exit 0
+        mkswap /dev/zram0 >/dev/null 2>&1 || exit 0
+        # busybox swapon may lack -p support; plain swapon then
+        swapon -p 100 /dev/zram0 2>/dev/null || swapon /dev/zram0 || exit 0
+        echo 100 > /proc/sys/vm/swappiness
+        echo "zram: $SIZE swap on /dev/zram0"
+        ;;
+    stop)
+        swapoff /dev/zram0 2>/dev/null
+        ;;
+esac

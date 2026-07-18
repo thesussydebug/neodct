@@ -512,3 +512,23 @@ overlay Browser app: drain queued keypresses on exit (TDD'd, 4 pytest
 cases) - keypad fd backlog + i2c scanner pending queue made the UI
 replay stale presses as random menu actions after the browser closed;
 browser stderr now goes to /dev/console for the mem log
+
+--- netsurf-neodct: zram, scoped fonts, crash + system memory logging ---
+system: zram swap + crash visibility for the browser
+
+- kernel (qemu board config): CONFIG_ZRAM/ZSMALLOC/LZO backends
+- overlay etc/init.d/S16zram: compressed swap sized to half of RAM
+  (busybox swapon -p fallback), swappiness 100
+- netsurf chrome: fatal-signal handler prints "neodct-crash: signal=N
+  last-rss-kb=X" async-safely on stderr/serial; periodic mem log now
+  includes whole-system pressure (MemAvailable/MemFree/SwapFree)
+- Browser app: reports how netsurf-fb exited ("KILLED by signal 11
+  (SIGSEGV)" etc, TDD'd) and dumps a dmesg tail on signal deaths so
+  OOM-killer reports surface even with a quiet console
+
+fonts: Nokia face only for chrome and home.html, DejaVu for the web
+
+- the system font now rides the fantasy/cursive faces (chrome widgets,
+  NeoDCT screens and home.html's font-family: fantasy); sans/serif/
+  monospace default to DejaVu (buildroot dejavu package added to the
+  qemu defconfig) so real sites like wikipedia render normally
