@@ -48,3 +48,9 @@ netsurf-neodct/
 # Local macOS Docker build helper + its output (not part of the repo)
 /build-macos.sh
 /output/
+
+# neopix generated test artifacts
+neodct/native/neopix/tests/fixtures/
+neodct/native/neopix/tests/run_tests
+neodct/overlay/root/npx_selftest
+neodct/overlay/NeoDCT/lib/libneopix.so

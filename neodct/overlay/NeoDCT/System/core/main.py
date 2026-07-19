@@ -23,6 +23,7 @@ from System.core.ModemService import ModemService
 from System.core.BatteryService import BatteryService
 from System.core.NotifyService import NotifyService
 from System.core.CrashHandler import show_app_crash, log_crash
+from System.core import neopix
 import System.ui.Dialer.call_screen as dialer_ui
 import System.ui.Dialer.incoming_screen as incoming_ui
 import System.apps.PhoneBook.shared.list_ui as contact_manager
@@ -313,6 +314,7 @@ class Framebuffer:
         self.mm.write(b"\x00" * self.size)
 
         self.native_img = None
+        self._bgra_out = None
         self._black = (0, 0, 0)
 
         # Detect the pixel conversion path ONCE (Pillow >= 11 removed the
@@ -331,6 +333,8 @@ class Framebuffer:
             path = "BGR;16 16bpp (C, fast)"
         else:
             path = "PYTHON RGB565 PACK 16bpp (SLOW -- ~350ms/frame on RV1103!)"
+        if neopix.available():
+            path += " +neopix"
         print(f"[FB] {self.xres}x{self.yres} @ {self.bpp}bpp, pixel path: {path}")
 
         # RGB565 fallback tables/buffers exist only on the 16bpp-without-
@@ -405,12 +409,23 @@ class Framebuffer:
                     band = src.tobytes("raw", "BGR;16")
                 else:
                     src_bytes = src.tobytes()
-                    used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
+                    if neopix.available():
+                        neopix.rgb_to_565le(src_bytes, self._rgb565_band_out)
+                        used = (len(src_bytes) // 3) * 2
+                    else:
+                        used = self._pack_rgb565(src_bytes, self._rgb565_band_out)
                     band = self._rgb565_band_out[:used]
                 self._write_center_band(band, copy_w, copy_h, dst_x, dst_y)
                 return
             if self.bpp == 32:
-                band = src.convert("RGBA").tobytes("raw", "BGRA")
+                if neopix.available():
+                    if self._bgra_out is None:
+                        self._bgra_out = bytearray(self.stride_pixels * self.yres * 4)
+                    src_bytes = src.tobytes()
+                    neopix.rgb_to_bgra(src_bytes, self._bgra_out)
+                    band = memoryview(self._bgra_out)[:(len(src_bytes) // 3) * 4]
+                else:
+                    band = src.convert("RGBA").tobytes("raw", "BGRA")
                 self._write_center_band(band, copy_w, copy_h, dst_x, dst_y)
                 return
 
@@ -421,7 +436,13 @@ class Framebuffer:
         self.native_img.paste(cropped, (dst_x, dst_y))
 
         if self.bpp == 32:
-            data = self.native_img.convert("RGBA").tobytes("raw", "BGRA")
+            if neopix.available():
+                if self._bgra_out is None:
+                    self._bgra_out = bytearray(self.stride_pixels * self.yres * 4)
+                neopix.rgb_to_bgra(self.native_img.tobytes(), self._bgra_out)
+                data = memoryview(self._bgra_out)
+            else:
+                data = self.native_img.convert("RGBA").tobytes("raw", "BGRA")
         elif self.bpp == 16:
             rgb_img = self.native_img
             if self._has_bgr16:
@@ -430,7 +451,10 @@ class Framebuffer:
             else:
                 # Fallback for Pillow >= 11 builds: software-pack RGB565.
                 out = self._rgb565_out
-                self._pack_rgb565(rgb_img.tobytes(), out)
+                if neopix.available():
+                    neopix.rgb_to_565le(rgb_img.tobytes(), out)
+                else:
+                    self._pack_rgb565(rgb_img.tobytes(), out)
                 data = out
         else:
             data = self.native_img.tobytes()
