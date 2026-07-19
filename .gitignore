@@ -34,7 +34,7 @@ secrets/
 ############################
 # NeoDCT user data (runtime content)
 ############################
-neodct/overlay/User/music/
+neodct/overlay/NeoDCT/User/music/
 
 ############################
 # NeoDCT large test media (keep repo lean)
@@ -43,4 +43,9 @@ neodct/overlay/tests/*.avi
 neodct/overlay/tests/*.mp3
 neodct/overlay/tests/*.mp4
 neodct/overlay/tests/*.mkv
+<<<<<<< Updated upstream
 netsurf-neodct/
+=======
+/build-macos.sh
+/output/
+
