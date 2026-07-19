@@ -44,3 +44,7 @@ neodct/overlay/tests/*.mp3
 neodct/overlay/tests/*.mp4
 neodct/overlay/tests/*.mkv
 netsurf-neodct/
+
+# Local macOS Docker build helper + its output (not part of the repo)
+/build-macos.sh
+/output/
