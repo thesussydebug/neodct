@@ -14,7 +14,9 @@
 #include "home.h"
 #include "input.h"
 #include "layout.h"
+#include "menu.h"
 #include "neopix.h"
+#include "neopng.h"
 #include "neotext.h"
 #include "ui.h"
 
@@ -27,6 +29,7 @@
 struct app_entry {
     int id;
     char name[40];
+    char icon[256];
 };
 
 static uint8_t *slurp(const char *path, long *len) {
@@ -78,12 +81,96 @@ static int scan_dir(const char *base, struct app_entry *apps, int n, int max) {
         if (json_str((char *)raw, "name", apps[n].name, sizeof apps[n].name) == 0 &&
             json_str((char *)raw, "id", idbuf, sizeof idbuf) == 0) {
             apps[n].id = atoi(idbuf);
+            snprintf(apps[n].icon, sizeof apps[n].icon, "%s/%s/icon.png",
+                     base, e->d_name);
             n++;
         }
         free(raw);
     }
     closedir(d);
     return n;
+}
+
+#define ICON_CACHE_MAX 40
+
+struct icon_cache_entry {
+    char path[224];
+    int w, h;
+    uint8_t *rgba;
+};
+
+struct icon_cache {
+    struct icon_cache_entry e[ICON_CACHE_MAX];
+    int n;
+    double scale;
+};
+
+/* Mirrors _get_status_icon: decode once, scale by H/240, cache at display size. */
+static int icon_load_sized(struct icon_cache *c, const char *path,
+                           int cap, int *w, int *h, uint8_t **rgba) {
+    char key[224];
+    snprintf(key, sizeof key, "%d|%s", cap, path);
+    for (int i = 0; i < c->n; i++) {
+        if (strcmp(c->e[i].path, key) == 0) {
+            *w = c->e[i].w;
+            *h = c->e[i].h;
+            size_t sz = (size_t)*w * *h * 4;
+            *rgba = malloc(sz);
+            if (!*rgba) return -1;
+            memcpy(*rgba, c->e[i].rgba, sz);
+            return 0;
+        }
+    }
+
+    long n;
+    uint8_t *png = slurp(path, &n);
+    if (!png) return -1;
+    int sw, sh;
+    uint8_t *full = NULL;
+    if (npng_decode(png, n, &sw, &sh, &full) != 0) { free(png); return -1; }
+    free(png);
+
+    int dw, dh;
+    if (cap > 0) {
+        dw = sw; dh = sh;
+        if (sw > cap || sh > cap) {
+            if (sw >= sh) { dw = cap; dh = (int)((double)sh * cap / sw); }
+            else { dh = cap; dw = (int)((double)sw * cap / sh); }
+            if (dw < 1) dw = 1;
+            if (dh < 1) dh = 1;
+        }
+    } else {
+        dw = (int)(sw * c->scale); if (dw < 1) dw = 1;
+        dh = (int)(sh * c->scale); if (dh < 1) dh = 1;
+    }
+    uint8_t *out = full;
+    if (dw != sw || dh != sh) {
+        out = malloc((size_t)dw * dh * 4);
+        if (!out || npx_resize_rgba(full, sw, sh, out, dw, dh) != 0) {
+            free(full); free(out); return -1;
+        }
+        free(full);
+    }
+
+    if (c->n < ICON_CACHE_MAX) {
+        struct icon_cache_entry *e = &c->e[c->n++];
+        snprintf(e->path, sizeof e->path, "%s", key);
+        e->w = dw; e->h = dh;
+        e->rgba = malloc((size_t)dw * dh * 4);
+        if (e->rgba) memcpy(e->rgba, out, (size_t)dw * dh * 4);
+        else c->n--;
+    }
+    *w = dw; *h = dh; *rgba = out;
+    return 0;
+}
+
+static int icon_load(void *ctx, const char *path, int *w, int *h, uint8_t **rgba) {
+    return icon_load_sized(ctx, path, 0, w, h, rgba);
+}
+
+static int menu_icon_load(void *ctx, const char *path, int cap,
+                          int *w, int *h, uint8_t **rgba) {
+    return icon_load_sized(ctx, path, cap, w, h, rgba);
 }
 
 static void draw_softkey(const uint8_t *atlas, uint8_t *canvas,
@@ -143,6 +230,10 @@ int main(void) {
     qsort(apps, app_count, sizeof apps[0], cmp_app);
     printf("[SHELL] %d apps\n", app_count);
 
+    struct icon_cache icons;
+    memset(&icons, 0, sizeof icons);
+    icons.scale = (double)UI_H / 240.0;
+
     struct nui_state ui;
     nui_init(&ui, app_count);
     uint8_t *canvas = malloc((size_t)UI_W * UI_H * 3);
@@ -191,21 +282,15 @@ int main(void) {
         snprintf(last_clock, sizeof last_clock, "%s", clock);
 
         if (ui.screen == NUI_HOME) {
-            nhome_render_clock(&layout, &fonts, canvas, UI_W, UI_H, clock);
+            nhome_render_full(&layout, &fonts, canvas, UI_W, UI_H, clock,
+                              icon_load, &icons);
             draw_softkey(a20, canvas, "Menu");
         } else {
-            npx_fill_rect(canvas, UI_W, UI_H, 0, 0, UI_W, UI_H, 0, 0, 0);
+            struct nmenu_fonts mf = { a20, a24 };
             const char *name = app_count > 0 ? apps[ui.selected].name : "No Apps";
-            int x0, y0, x1, y1;
-            if (ntx_bbox(a24, name, &x0, &y0, &x1, &y1) == 0)
-                ntx_draw(a24, name, canvas, UI_W, UI_H,
-                         (UI_W - (x1 - x0)) / 2, 50, 255, 255, 255);
-            char pos[16];
-            snprintf(pos, sizeof pos, "%d", ui.selected + 1);
-            if (ntx_bbox(a14, pos, &x0, &y0, &x1, &y1) == 0)
-                ntx_draw(a14, pos, canvas, UI_W, UI_H,
-                         UI_W - 5 - (x1 - x0), 10, 255, 255, 255);
-            draw_softkey(a20, canvas, "Select");
+            const char *ipath = app_count > 0 ? apps[ui.selected].icon : "";
+            nmenu_render(&mf, canvas, UI_W, UI_H, name, ipath,
+                         ui.selected, app_count, menu_icon_load, &icons);
         }
         nfb_present(&fb, canvas, UI_W, UI_H, fbmem);
     }

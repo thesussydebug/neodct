@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Werror
 
-TESTBINS := tests/run_input_tests tests/run_ui_tests tests/run_fb_tests tests/run_layout_tests tests/run_home_tests
+TESTBINS := tests/run_input_tests tests/run_ui_tests tests/run_fb_tests tests/run_layout_tests tests/run_home_tests tests/run_menu_tests
 
 test: fixtures $(TESTBINS)
 	@for t in $(TESTBINS); do echo "-- $$t"; ./$$t || exit 1; done
@@ -18,12 +18,17 @@ tests/run_fb_tests: tests/test_fb.c fb.c fb.h ../neopix/neopix.c
 tests/run_layout_tests: tests/test_layout.c layout.c layout.h
 	$(CC) $(CFLAGS) -DTEST_DIR='"tests"' -I. tests/test_layout.c layout.c -o $@
 
-tests/run_home_tests: tests/test_home.c home.c home.h layout.c ../neopix/neopix.c ../neopix/neotext.c
-	$(CC) $(CFLAGS) -DTEST_DIR='"tests"' -I. -I../neopix tests/test_home.c home.c layout.c ../neopix/neopix.c ../neopix/neotext.c -o $@
+tests/run_home_tests: tests/test_home.c home.c home.h layout.c ../neopix/neopix.c ../neopix/neotext.c ../neopix/neopng.c ../neopix/neozlib.c
+	$(CC) $(CFLAGS) -DTEST_DIR='"tests"' -I. -I../neopix tests/test_home.c home.c layout.c ../neopix/neopix.c ../neopix/neotext.c ../neopix/neopng.c ../neopix/neozlib.c -o $@
+
+tests/run_menu_tests: tests/test_menu.c menu.c menu.h ../neopix/neopix.c ../neopix/neotext.c ../neopix/neopng.c ../neopix/neozlib.c
+	$(CC) $(CFLAGS) -DTEST_DIR='"tests"' -I. -I../neopix tests/test_menu.c menu.c ../neopix/neopix.c ../neopix/neotext.c ../neopix/neopng.c ../neopix/neozlib.c -o $@
 
 fixtures:
 	python3 tests/gen_fb_fixture.py
 	python3 tests/gen_home_fixture.py
+	python3 tests/gen_home_icons_fixture.py
+	python3 tests/gen_menu_fixture.py
 	cp ../neopix/tests/fixtures/font_atlas_*.bin tests/fixtures/ 2>/dev/null || true
 
 clean:
@@ -32,7 +37,7 @@ clean:
 .PHONY: test fixtures clean
 
 OVERLAY := ../../overlay/NeoDCT
-SHELL_SRC := main.c fb.c home.c input.c layout.c ui.c ../neopix/neopix.c ../neopix/neotext.c
+SHELL_SRC := main.c fb.c home.c input.c layout.c menu.c ui.c ../neopix/neopix.c ../neopix/neotext.c ../neopix/neopng.c ../neopix/neozlib.c
 
 atlases:
 	python3 tests/gen_font_atlases.py

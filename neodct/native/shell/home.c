@@ -25,10 +25,11 @@ static const uint8_t *pick_font(const struct nhome_fonts *f, int size) {
     return f->small;
 }
 
-int nhome_render_clock(const struct nlay_layout *layout,
-                       const struct nhome_fonts *fonts,
-                       uint8_t *canvas_rgb, int w, int h,
-                       const char *clock) {
+int nhome_render_full(const struct nlay_layout *layout,
+                      const struct nhome_fonts *fonts,
+                      uint8_t *canvas_rgb, int w, int h,
+                      const char *clock,
+                      nhome_icon_loader loader, void *loader_ctx) {
     if (!layout || !fonts || !canvas_rgb) return -1;
     npx_fill_rect(canvas_rgb, w, h, 0, 0, w, h, 0, 0, 0);
 
@@ -51,6 +52,19 @@ int nhome_render_clock(const struct nlay_layout *layout,
             ntx_draw(atlas, txt, canvas_rgb, w, h, x, y, r, g, b);
         }
         else if (e->type == NLAY_ICON_SET) {
+            int level = e->sim_val;
+            if (level < 0) level = 0;
+            if (level >= NLAY_MAX_LEVELS) level = NLAY_MAX_LEVELS - 1;
+            const char *ipath = e->custom_images[level];
+            if (loader && ipath[0]) {
+                int iw, ih;
+                uint8_t *rgba = NULL;
+                if (loader(loader_ctx, ipath, &iw, &ih, &rgba) == 0 && rgba) {
+                    npx_blit_rgba(canvas_rgb, w, h, rgba, iw, ih, x, y);
+                    free(rgba);
+                    continue;
+                }
+            }
             int count = e->count > 0 ? e->count : 5;
             int step = (int)(w * 0.021);
             if (step < 3) step = 3;
@@ -66,8 +80,15 @@ int nhome_render_clock(const struct nlay_layout *layout,
     return 0;
 }
 
+int nhome_render_clock(const struct nlay_layout *layout,
+                       const struct nhome_fonts *fonts,
+                       uint8_t *canvas_rgb, int w, int h,
+                       const char *clock) {
+    return nhome_render_full(layout, fonts, canvas_rgb, w, h, clock, NULL, NULL);
+}
+
 int nhome_render(const struct nlay_layout *layout,
                  const struct nhome_fonts *fonts,
                  uint8_t *canvas_rgb, int w, int h) {
-    return nhome_render_clock(layout, fonts, canvas_rgb, w, h, NULL);
+    return nhome_render_full(layout, fonts, canvas_rgb, w, h, NULL, NULL, NULL);
 }

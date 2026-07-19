@@ -18,7 +18,7 @@ clear > /dev/tty0
 # 4. Run the UI
 echo "[NeoDCT] Booting..." > /dev/tty0
 if [ "${NEODCT_UI:-c}" = "c" ] && [ -x /usr/bin/neodct-shell ]; then
-    /usr/bin/neodct-shell 2> /NeoDCT/crash.log
+    /usr/bin/neodct-shell > /NeoDCT/shell.log 2>&1
 else
     python3 /NeoDCT/launcher.py 2> /NeoDCT/crash.log
 fi

@@ -1,4 +1,6 @@
 #include "../home.h"
+#include "neopng.h"
+#include "neopix.h"
 #include "../layout.h"
 #include "../../neopix/tests/runner.h"
 
@@ -66,9 +68,56 @@ static void test_clock_placeholder_is_substituted(void) {
     free(json); free(a14); free(a20); free(a24); free(canvas); free(want);
 }
 
+/* Loader mirroring _get_status_icon: decode PNG, scale by H/240, return RGBA. */
+static int fixture_loader(void *ctx, const char *path, int *w, int *h,
+                          unsigned char **rgba) {
+    (void)ctx;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char name[128];
+    snprintf(name, sizeof name, "icon_%s", base);
+    long n;
+    unsigned char *png = load_fix(name, &n);
+    int sw, sh;
+    unsigned char *full = NULL;
+    if (npng_decode(png, n, &sw, &sh, &full) != 0) { free(png); return -1; }
+    free(png);
+
+    double scale = 175.0 / 240.0;
+    int dw = (int)(sw * scale); if (dw < 1) dw = 1;
+    int dh = (int)(sh * scale); if (dh < 1) dh = 1;
+    if (dw == sw && dh == sh) { *w = sw; *h = sh; *rgba = full; return 0; }
+    unsigned char *small = malloc((size_t)dw * dh * 4);
+    if (npx_resize_rgba(full, sw, sh, small, dw, dh) != 0) {
+        free(full); free(small); return -1;
+    }
+    free(full);
+    *w = dw; *h = dh; *rgba = small;
+    return 0;
+}
+
+static void test_home_with_png_icons_matches_python(void) {
+    char *json = slurp("home_icons_layout.json");
+    struct nlay_layout l;
+    if (nlay_parse(json, &l) != 0) { printf("  FAIL  layout parse\n"); t_fail++; free(json); return; }
+    unsigned char *a14 = load_fix("font_atlas_14.bin", NULL);
+    unsigned char *a20 = load_fix("font_atlas_20.bin", NULL);
+    unsigned char *a24 = load_fix("font_atlas_24.bin", NULL);
+    struct nhome_fonts fonts = { a14, a20, a24 };
+    unsigned char *canvas = calloc(1, 240 * 175 * 3);
+
+    nhome_render_full(&l, &fonts, canvas, 240, 175, NULL, fixture_loader, NULL);
+
+    unsigned char *want = load_fix("home_icons_expected.bin", NULL);
+    bytes_equal("home screen with PNG status icons matches Python",
+                canvas, want, 240 * 175 * 3);
+    free(json); free(a14); free(a20); free(a24); free(canvas); free(want);
+}
+
 int main(void) {
     test_home_matches_python_render();
     test_render_clears_canvas_first();
     test_clock_placeholder_is_substituted();
+    test_home_with_png_icons_matches_python();
     return SUMMARY();
 }
