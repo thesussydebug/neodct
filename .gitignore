@@ -72,3 +72,11 @@ neodct/overlay/usr/bin/neodct-shell
 neodct/overlay/NeoDCT/System/ui/resources/fonts/atlas_*.bin
 # stray nested overlay from an early path bug
 neodct/native/overlay/
+neodct/overlay/NeoDCT/System/apps/*/app
+neodct/overlay/NeoDCT/System/engineering/apps/*/app
+neodct/overlay/usr/lib/libluajit*
+neodct/overlay/usr/bin/luajit
+neodct/overlay/root/ljtest.lua
+neodct/overlay/root/tinput_test.lua
+neodct/native/tools/luajit-host
+neodct/native/tools/libluajit.a
