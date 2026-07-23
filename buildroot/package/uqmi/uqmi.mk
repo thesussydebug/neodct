@@ -11,4 +11,7 @@ UQMI_LICENSE = LGPL-2.0+
 UQMI_LICENSE_FILES = main.c
 UQMI_DEPENDENCIES = json-c libubox
 
+# Host cmake >= 4 refuses the pre-3.5 cmake_minimum_required upstream ships.
+UQMI_CONF_OPTS += -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
 $(eval $(cmake-package))

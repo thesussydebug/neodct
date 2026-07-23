@@ -1,0 +1,4 @@
+# NeoDCT additions to the stock buildroot busybox config.
+# T-Mobile is IPv6-only, so the modem data path needs ping -6 / ping6
+# for the S45modem connectivity check and on-device debugging.
+CONFIG_PING6=y
