@@ -19,8 +19,16 @@ into the rootfs.
 
 import builtins
 import os
+import shutil
+import sys
+import tempfile
 
 from PIL import Image
+
+REPO_NEODCT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "overlay", "NeoDCT",
+)
 
 # Device geometry (see System/core/main.py).
 PANEL_W = 240
@@ -44,8 +52,28 @@ class CapturingFramebuffer:
         self.frames = []
         self.xres, self.yres = panel_size
         self.bpp = 32
+        self._budget = None
+        self._drawn = 0
+
+    def set_budget(self, frames):
+        """Allow only `frames` more draws, then raise ScriptExhausted.
+
+        Real-time apps (Koki) read the evdev fd directly and never call
+        read_keypress, so no key-based signal can stop them. Every app
+        does draw, though, which makes this the one reliable choke point.
+        """
+        self._budget = frames
+        self._drawn = 0
+
+    def clear_budget(self):
+        self._budget = None
+        self._drawn = 0
 
     def update(self, pil_image):
+        if self._budget is not None:
+            if self._drawn >= self._budget:
+                raise ScriptExhausted()
+            self._drawn += 1
         # Copy: the UI redraws onto one long-lived canvas, so a reference
         # would leave every captured frame showing the final screen.
         self.frames.append(pil_image.convert("RGB").copy())
@@ -74,22 +102,29 @@ class PathRemap:
     staging directory instead.
     """
 
-    # (module, attribute, index of the path argument)
+    # (module, attribute, indices of the path arguments)
     _TARGETS = (
-        ("builtins", "open", 0),
-        ("os.path", "exists", 0),
-        ("os.path", "isfile", 0),
-        ("os.path", "isdir", 0),
-        ("os.path", "getsize", 0),
-        ("os", "listdir", 0),
-        ("os", "makedirs", 0),
-        ("os", "mkdir", 0),
-        ("os", "remove", 0),
-        ("os", "stat", 0),
-        ("os", "access", 0),
-        ("sqlite3", "connect", 0),
-        ("PIL.Image", "open", 0),
-        ("PIL.ImageFont", "truetype", 0),
+        ("builtins", "open", (0,)),
+        ("os.path", "exists", (0,)),
+        ("os.path", "isfile", (0,)),
+        ("os.path", "isdir", (0,)),
+        ("os.path", "getsize", (0,)),
+        ("os", "listdir", (0,)),
+        ("os", "walk", (0,)),
+        ("os", "makedirs", (0,)),
+        ("os", "mkdir", (0,)),
+        ("os", "remove", (0,)),
+        ("os", "unlink", (0,)),
+        ("os", "stat", (0,)),
+        ("os", "access", (0,)),
+        # Two-path calls: settings.prop is written atomically via rename.
+        ("os", "rename", (0, 1)),
+        ("os", "replace", (0, 1)),
+        ("shutil", "copyfile", (0, 1)),
+        ("shutil", "copy", (0, 1)),
+        ("sqlite3", "connect", (0,)),
+        ("PIL.Image", "open", (0,)),
+        ("PIL.ImageFont", "truetype", (0,)),
     )
 
     def __init__(self, staged_root):
@@ -115,22 +150,24 @@ class PathRemap:
         return importlib.import_module(dotted)
 
     def __enter__(self):
-        for dotted, attr, arg_index in self._TARGETS:
+        for dotted, attr, arg_indices in self._TARGETS:
             module = self._resolve(dotted)
             original = getattr(module, attr, None)
             if original is None:
                 continue
             self._saved.append((module, attr, original))
-            setattr(module, attr, self._wrap(original, arg_index))
+            setattr(module, attr, self._wrap(original, arg_indices))
         return self
 
-    def _wrap(self, original, arg_index):
+    def _wrap(self, original, arg_indices):
         remap = self.map_path
 
         def wrapper(*args, **kwargs):
-            if len(args) > arg_index:
+            if args:
                 args = list(args)
-                args[arg_index] = remap(args[arg_index])
+                for index in arg_indices:
+                    if len(args) > index:
+                        args[index] = remap(args[index])
             return original(*args, **kwargs)
 
         wrapper.__name__ = getattr(original, "__name__", "wrapped")
@@ -158,12 +195,19 @@ class KeyScript:
     on_exhausted="none"  -> pop() returns None (the runtime keeps polling)
     on_exhausted="raise" -> pop() raises ScriptExhausted to break a
                             blocking .show() loop once the script is done
+    idle_budget          -> how many consecutive idle polls to allow before
+                            raising. Game loops poll read_keypress instead
+                            of blocking, so a plain None lets them spin
+                            forever; the budget lets them animate a few
+                            frames and then unwinds them.
     """
 
-    def __init__(self, keys=(), on_exhausted="none"):
+    def __init__(self, keys=(), on_exhausted="none", idle_budget=None):
         self._keys = list(keys)
         self.on_exhausted = on_exhausted
+        self.idle_budget = idle_budget
         self.consumed = []
+        self._idle = 0
 
     def push(self, *keys):
         self._keys.extend(keys)
@@ -172,10 +216,211 @@ class KeyScript:
         if self._keys:
             key = self._keys.pop(0)
             self.consumed.append(key)
+            self._idle = 0
             return key
         if self.on_exhausted == "raise":
+            raise ScriptExhausted()
+        self._idle += 1
+        if self.idle_budget is not None and self._idle > self.idle_budget:
             raise ScriptExhausted()
         return None
 
     def __len__(self):
         return len(self._keys)
+
+
+def stage_overlay(dest=None):
+    """Copy the repo overlay somewhere writable and return the NeoDCT root.
+
+    The runtime creates databases, settings and ack files under
+    /NeoDCT/User; staging keeps all of that out of the working tree.
+    """
+    if dest is None:
+        dest = tempfile.mkdtemp(prefix="neodct-stub-")
+    root = os.path.join(str(dest), "NeoDCT")
+    if os.path.exists(root):
+        shutil.rmtree(root)
+    shutil.copytree(
+        REPO_NEODCT, root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    return root
+
+
+class StubUI:
+    """Boots the real NeoDCT_UI against stubbed hardware.
+
+    Used as a context manager so the path patching is always undone::
+
+        with StubUI(wallpaper="Palestine.jpg") as ui:
+            ui.update()
+            ui.fb.device_frame().save("home.png")
+    """
+
+    def __init__(self, wallpaper=None, settings=None, keys=(),
+                 engineering=True, root=None, skip_notice=True,
+                 idle_budget=60):
+        self.root = root or stage_overlay()
+        self.remap = PathRemap(self.root)
+        self.fb = CapturingFramebuffer()
+        self.keys = KeyScript(keys, idle_budget=idle_budget)
+        self._wallpaper_name = wallpaper
+        self._settings = dict(settings or {})
+        self._engineering = engineering
+        self._skip_notice = skip_notice
+        self._ui = None
+
+    # --- lifecycle -------------------------------------------------------
+
+    def __enter__(self):
+        if REPO_NEODCT not in sys.path:
+            sys.path.insert(0, REPO_NEODCT)
+
+        self._prepare_user_dir()
+        self.remap.__enter__()
+        try:
+            return self._boot()
+        except BaseException:
+            self.remap.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        self.remap.__exit__(exc_type, exc, tb)
+        return False
+
+    def _prepare_user_dir(self):
+        user = os.path.join(self.root, "User")
+        os.makedirs(user, exist_ok=True)
+        if self._skip_notice:
+            # Skips the modal "alpha software" notice on first boot.
+            with open(os.path.join(user, ".ack_security_warning"), "w") as f:
+                f.write("0")
+
+        values = {
+            "system.ui.engineering_mode": "ON" if self._engineering else "OFF",
+        }
+        if self._wallpaper_name:
+            values["system.ui.wallpaper"] = (
+                NEODCT_PREFIX + "/User/wallpapers/" + self._wallpaper_name
+            )
+        values.update(self._settings)
+
+        lines = [f"{key}={value}\n" for key, value in sorted(values.items())]
+        with open(os.path.join(user, "settings.prop"), "w") as f:
+            f.writelines(lines)
+
+    def _boot(self):
+        from System.core import main as core_main
+
+        # Never touch a real /dev/input device: an unreachable path makes
+        # NeoDCT_UI fall back to "no input backend", which is what we want
+        # since keys come from the script instead.
+        dead_input = os.path.join(self.root, "no-such-input")
+        original_discover = core_main._discover_keypad_path
+        original_keypad_path = core_main.KEYPAD_PATH
+        core_main._discover_keypad_path = lambda: dead_input
+        # The runtime retries KEYPAD_PATH when discovery fails; point that
+        # at the same dead path so no real evdev node is ever opened.
+        core_main.KEYPAD_PATH = dead_input
+        try:
+            ui = core_main.NeoDCT_UI(self.fb)
+        finally:
+            core_main._discover_keypad_path = original_discover
+            core_main.KEYPAD_PATH = original_keypad_path
+
+        ui.read_keypress = self.keys.pop
+        ui.wait_for_key = self._wait_for_key
+        # Handy back-references for callers driving the UI.
+        ui.keys = self.keys
+        ui.fb = self.fb
+        ui.root = self.root
+        ui.stub = self
+        self._ui = ui
+        return ui
+
+    def install_app(self, source_dir, engineering=False):
+        """Copy an app folder into the staged rootfs and rescan.
+
+        Same thing as dropping it in /NeoDCT/System/apps on the device,
+        which is all "installing" means on NeoDCT.
+        """
+        ui = self._ui
+        section = "engineering/apps" if engineering else "apps"
+        dest = os.path.join(self.root, "System", section,
+                            os.path.basename(str(source_dir).rstrip("/")))
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(str(source_dir), dest,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+        ui.apps = []
+        app_dirs = [NEODCT_PREFIX + "/System/apps"]
+        if getattr(ui, "engineering_mode", False):
+            app_dirs.append(NEODCT_PREFIX + "/System/engineering/apps")
+        for app_dir in app_dirs:
+            ui._scan_apps_from_dir(app_dir)
+        ui.apps.sort(key=lambda app: app["id"])
+        return dest
+
+    def simulate_status(self, battery=4, signal=4, carrier=None):
+        """Pretend a fuel gauge and a registered modem are present.
+
+        With neither, the home screen honestly draws "?" for the battery
+        and "No Service" for the carrier. Screenshots of a normal device
+        want the real thing, so the two accessors the home layout reads
+        are stubbed here.
+        """
+        ui = self._ui
+        ui.battery.hardware = True
+        ui.battery._level = battery
+        ui.modem.signal_level = lambda: signal
+        ui.modem.operator_display = lambda: carrier
+        return ui
+
+    def _wait_for_key(self):
+        """Blocking read, but scripted: never spins once the script ends."""
+        key = self.keys.pop(0.1)
+        if key is None:
+            raise ScriptExhausted()
+        return key
+
+
+def run_app(ui, name, keys=(), frame_budget=240):
+    """Launch a shipped app by its manifest name and return its frames.
+
+    Mirrors NeoDCT_UI.launch_app (importlib under the module name
+    "neodct_app", then run(ui)), but lets ScriptExhausted through instead
+    of treating it as a crash -- running out of scripted keys is how the
+    harness leaves an app that would otherwise loop forever.
+    """
+    import importlib.util
+
+    for app in ui.apps:
+        if app["name"] == name:
+            break
+    else:
+        available = ", ".join(sorted(a["name"] for a in ui.apps))
+        raise KeyError(f"no app named {name!r}; have: {available}")
+
+    ui.keys.push(*keys)
+    start = len(ui.fb.frames)
+
+    # importlib reads source through io.open_code (a C call PathRemap does
+    # not intercept), so the manifest's /NeoDCT path is mapped up front.
+    path = os.path.join(app["path"], app["exec"])
+    stub = getattr(ui, "stub", None)
+    if stub is not None:
+        path = stub.remap.map_path(path)
+
+    spec = importlib.util.spec_from_file_location("neodct_app", path)
+    module = importlib.util.module_from_spec(spec)
+    ui.fb.set_budget(frame_budget)
+    try:
+        spec.loader.exec_module(module)
+        module.run(ui)
+    except ScriptExhausted:
+        pass
+    finally:
+        ui.fb.clear_budget()
+
+    return ui.fb.frames[start:]

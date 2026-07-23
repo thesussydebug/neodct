@@ -625,3 +625,52 @@ neodct rootfs (luckfox_pico_mini_defconfig, both copies synced):
   fragment + alsa aplay (call downlink pipe was missing on hw!) +
   BR2_TOOLCHAIN_BUILDROOT_CXX (live config had it, canonical lacked it)
 - build-luckfox live .config regenerated from the defconfig
+
+--- docs: HTML documentation site + headless UI stub ---
+
+New host-side tooling (neodct/tools/, never shipped to the device):
+
+- uistub.py: headless stub of the whole runtime. Boots the REAL
+  NeoDCT_UI/framework/apps with no framebuffer, keypad, modem or
+  /NeoDCT rootfs, and captures frames as PIL images.
+  * CapturingFramebuffer stands in for core.main.Framebuffer and can
+    composite the 240x175 band onto the 240x240 panel (device_frame)
+  * PathRemap redirects hardcoded /NeoDCT/... paths into a staged copy
+    of the overlay -- no root, no chroot, and writes never touch the
+    working tree (found a real gap: settings.prop is saved via
+    os.rename, which needs BOTH path args remapped)
+  * KeyScript replays evdev codes; when it drains it raises
+    ScriptExhausted (a BaseException, like IncomingCall) so blocking
+    widget loops unwind instead of hanging
+  * frame budget stops real-time apps that never poll read_keypress at
+    all (Koki reads ui.keypad_fd directly) at the one choke point every
+    app passes through: fb.update()
+  * install_app() copies an app folder in and rescans, i.e. exactly
+    what "installing" means on the device
+  * simulate_status() fakes a fuel gauge + registered modem so doc
+    shots show a normal device instead of "?" / "No Service"
+  * never attaches to a real input device -- the runtime's evdev
+    fallback to /dev/input/event0 is stubbed out too, so the harness
+    cannot race the developer's own keyboard
+
+- shoot_docs.py: renders all 55 documentation screenshots (home, app
+  selector, every stock + engineering app, call/ring/crash screens,
+  the widget gallery, the tutorial examples) in under a minute.
+
+- tests/test_uistub.py: 37 tests, written test-first. Cover the device
+  geometry (240x175 band centred on the 240x240 panel, band starts at
+  row 32), path remapping and restoration, key scripting, app scanning,
+  wallpaper loading, and both loop-escape mechanisms. Skipped when PIL
+  is unavailable; the pre-existing 76 tests are untouched (113 total).
+
+Documentation site lives OUTSIDE the repo at ../neodct-docs (8 pages):
+index, how-it-works, stock-apps, apps (tutorial + full ui reference),
+widgets, modem, hardware, building. White-on-black with the shipped
+Nokia Cellphone FC face, hand-authored SVG diagrams, no JS deps beyond
+a ~70-line syntax highlighter. Modem and system pages are written for
+readers who have never seen an AT command. Three tutorial apps
+(HelloNeoDCT, Dice, Countdown) ship with the docs with 8 tests of their
+own.
+
+Note: the README status table is now well out of date -- it still lists
+telephony/SMS/settings as unimplemented. The docs page reflects 0.3.0a.
