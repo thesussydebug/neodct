@@ -532,3 +532,145 @@ fonts: Nokia face only for chrome and home.html, DejaVu for the web
   NeoDCT screens and home.html's font-family: fantasy); sans/serif/
   monospace default to DejaVu (buildroot dejavu package added to the
   qemu defconfig) so real sites like wikipedia render normally
+
+--- modem: self-healing data bring-up -- the modem is now the network device ---
+
+S45modem v2 (overlay etc/init.d/S45modem):
+- APN walk: wholesale (Tello, our SIM -- user confirmed) first, then
+  fast.t-mobile.com and tello.com; a rejected $QCRMCALL or missing
+  address moves to the next candidate instead of giving up
+- MODEM_RAW_IP=auto is now really automatic: call up but no SLAAC in
+  20s -> flip qmi_wwan to raw-ip framing and re-dial (many SIM7600
+  firmwares only speak raw-ip)
+- carrier DNS from AT+CGCONTRDP (AT+CGPIAF colon notation) goes into
+  resolv.conf ahead of the Google DNS64 fallback
+- winning APN + framing cached in /etc/modem.cache -> next boot
+  connects first-try; delete the file to re-probe
+- wwan0 prepped (accept_ra, framing, link up) BEFORE dialing so the
+  RS/RA exchange happens the moment the bearer rises
+- stop now also downs the wwan interface
+
+target tooling for an IPv6-only carrier:
+- busybox PING6 via new board/qemu/busybox.fragment (wired into both
+  neodct_qemu_defconfig copies): ping -6 / ping6 exist on target
+- BR2_PACKAGE_LIBCURL_CURL=y: real curl binary on target for
+  DNS64/NAT64/TLS debugging (same libcurl netsurf uses)
+
+proof harness:
+- scripts/qemu_modem_data_test.py: boots the image headless with the
+  modem passed through (-snapshot; rootfs untouched), logs in over the
+  serial socket, waits for S45modem's verdict, then checks global IPv6,
+  default route, ping6, DNS resolution, HTTP and HTTPS fetch -- one
+  command proves "internet purely from the modem"
+- docs/MODEM_BRINGUP.md: Stage 2 rewritten for the self-healing flow,
+  new Stage 4 (end-to-end proof), APN/ping6 troubleshooting rows
+
+- fix from first on-air run: eudev predictable naming calls the qmi_wwan
+  interface wwp0s5u3i5, not wwan0 -- S45modem and the Modem eng app now
+  find it by bound driver (qmi_wwan) with name prefixes as fallback
+
+- dialer reworked after 2nd on-air run (instant NO CARRIER x3 APNs while
+  registered on Tello, CSQ 16): APN was right (host NetworkManager
+  profile "Tello" = wholesale, verified via nmcli) so the suspects are
+  PDP type and the rewrite-cid1-while-attached quirk. Now: PDP-type walk
+  (IPV6 then IPV4V6 -- the proven mmcli bearer was ipv4v6), modem's own
+  cid1 definition tried early, PS re-attach (CGATT 0/1) between dial
+  rounds, one quick retry per dial, 4 rounds then endless background
+  redial every 120s (weak basement RF "eventually works" -- calls do),
+  AT+CEER reject-cause + AT+CPSI? RSRP logging on every rejection,
+  log rotation for the forever-retry path
+
+- 3rd on-air run cracked it open: +CGACT showed cid 2 ALREADY ACTIVE
+  (the attach/IMS PDN -- calls worked mid-failure) while every dial of
+  cid 1 got "+CEER: ESM sync up with network" ~1s after registration.
+  Dialer now: waits MODEM_ESM_SETTLE_S (8s) after CEREG before dialing,
+  logs the FULL context table, and each round first tries riding an
+  already-active non-IMS context (AT$QCRMCALL=1,<cid> untouched) before
+  walking APNs on cid 1; QCRMCALL/CGCONTRDP/teardown are cid-aware
+  (/tmp/modem-cid), rounds gate on current registration (basement drops
+  service mid-walk), ridden bearers are never cached as APNs
+
+- 4th run: cid 1 (fast.t-mobile.com IPV4V6) is ACTIVE per +CGACT -- the
+  network granted the internet PDN at attach -- yet $QCRMCALL still
+  instant-fails, now with "+CEER: EMM detached" (contradicted by
+  CEREG=1 + active bearers = stale internal state; ModemManager's QMI
+  session survives USB passthrough into QEMU). Countermeasures:
+  one-time AT+CFUN=1,1 module reset after a failed dial cycle
+  (MODEM_RESET_ON_FAIL=y), AT$QCRMCALL? state in diagnostics, and a
+  real QMI fallback -- BR2_PACKAGE_UQMI in both defconfigs, S45modem
+  ends each round with uqmi --start-network on /dev/cdc-wdm0 (the exact
+  path the host's proven ModemManager connection used); wwan prep
+  extracted to prep_wwan() and re-run after reset; non-numeric cid
+  (qmi) handled in DNS readback + teardown
+
+- buildroot pkg fixes for host cmake >= 4 (Arch): libubox.mk + uqmi.mk
+  get -DCMAKE_POLICY_VERSION_MINIMUM=3.5 (upstream ships pre-3.5
+  cmake_minimum_required and configure hard-fails otherwise)
+
+--- luckfox: kernel + rootfs caught up to the qemu feature set ---
+
+SDK kernel (luckfox-pico repo, luckfox_rv1106_linux_defconfig):
+- modem-as-network-device: USB_NET_DRIVERS/USB_USBNET/USB_NET_QMI_WWAN,
+  USB_WDM, USB_SERIAL_OPTION (AT ports on real hw)
+- browser support: ZRAM/ZSMALLOC/CRYPTO_LZO (S16zram swap),
+  INPUT_MISC/INPUT_UINPUT (t9_uinput bridge)
+- all verified present in the built objs_kernel/.config; boot.img
+  rebuilt via distrobox ./build.sh kernel
+- build gotcha fixed: objs_kernel/scripts held x86 host tools built on
+  native Arch (glibc 2.38+) -- modpost exploded inside the Ubuntu 22.04
+  distrobox; rm -rf objs_kernel/scripts and rebuild in the box
+
+neodct rootfs (luckfox_pico_mini_defconfig, both copies synced):
+- netsurf framebuffer + libcurl(+curl bin) + uqmi + busybox PING6
+  fragment + alsa aplay (call downlink pipe was missing on hw!) +
+  BR2_TOOLCHAIN_BUILDROOT_CXX (live config had it, canonical lacked it)
+- build-luckfox live .config regenerated from the defconfig
+
+--- docs: HTML documentation site + headless UI stub ---
+
+New host-side tooling (neodct/tools/, never shipped to the device):
+
+- uistub.py: headless stub of the whole runtime. Boots the REAL
+  NeoDCT_UI/framework/apps with no framebuffer, keypad, modem or
+  /NeoDCT rootfs, and captures frames as PIL images.
+  * CapturingFramebuffer stands in for core.main.Framebuffer and can
+    composite the 240x175 band onto the 240x240 panel (device_frame)
+  * PathRemap redirects hardcoded /NeoDCT/... paths into a staged copy
+    of the overlay -- no root, no chroot, and writes never touch the
+    working tree (found a real gap: settings.prop is saved via
+    os.rename, which needs BOTH path args remapped)
+  * KeyScript replays evdev codes; when it drains it raises
+    ScriptExhausted (a BaseException, like IncomingCall) so blocking
+    widget loops unwind instead of hanging
+  * frame budget stops real-time apps that never poll read_keypress at
+    all (Koki reads ui.keypad_fd directly) at the one choke point every
+    app passes through: fb.update()
+  * install_app() copies an app folder in and rescans, i.e. exactly
+    what "installing" means on the device
+  * simulate_status() fakes a fuel gauge + registered modem so doc
+    shots show a normal device instead of "?" / "No Service"
+  * never attaches to a real input device -- the runtime's evdev
+    fallback to /dev/input/event0 is stubbed out too, so the harness
+    cannot race the developer's own keyboard
+
+- shoot_docs.py: renders all 55 documentation screenshots (home, app
+  selector, every stock + engineering app, call/ring/crash screens,
+  the widget gallery, the tutorial examples) in under a minute.
+
+- tests/test_uistub.py: 37 tests, written test-first. Cover the device
+  geometry (240x175 band centred on the 240x240 panel, band starts at
+  row 32), path remapping and restoration, key scripting, app scanning,
+  wallpaper loading, and both loop-escape mechanisms. Skipped when PIL
+  is unavailable; the pre-existing 76 tests are untouched (113 total).
+
+Documentation site lives OUTSIDE the repo at ../neodct-docs (8 pages):
+index, how-it-works, stock-apps, apps (tutorial + full ui reference),
+widgets, modem, hardware, building. White-on-black with the shipped
+Nokia Cellphone FC face, hand-authored SVG diagrams, no JS deps beyond
+a ~70-line syntax highlighter. Modem and system pages are written for
+readers who have never seen an AT command. Three tutorial apps
+(HelloNeoDCT, Dice, Countdown) ship with the docs with 8 tests of their
+own.
+
+Note: the README status table is now well out of date -- it still lists
+telephony/SMS/settings as unimplemented. The docs page reflects 0.3.0a.

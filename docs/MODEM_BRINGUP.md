@@ -61,10 +61,12 @@ at AT+CEREG?       # -> +CEREG: 0,1     (…,1 home / …,5 roaming = registered
 at AT+COPS?        # -> +COPS: 0,0,"T-Mobile",7
 ```
 
-Then the data call (T-Mobile is IPv6-only with NAT64/DNS64):
+Then the data call (T-Mobile is IPv6-only with NAT64/DNS64). APN matters:
+our Tello SIM uses **`wholesale`**; a native T-Mobile SIM wants
+`fast.t-mobile.com` (S45modem walks both automatically, see Stage 2):
 
 ```sh
-at 'AT+CGDCONT=1,"IPV6","fast.t-mobile.com"'
+at 'AT+CGDCONT=1,"IPV6","wholesale"'
 at -t 15 'AT$QCRMCALL=1,1'          # firmware starts the RmNet call
 ip link set wwan0 up
 sysctl -w net.ipv6.conf.wwan0.accept_ra=2
@@ -87,9 +89,52 @@ Useful extras: `AT+CGPADDR=1` (modem's view of the address),
 
 `/etc/init.d/S45modem` runs the whole Stage-1 sequence in the background
 at every boot (boot itself never blocks): waits for the AT port, checks
-the SIM, defines the context, waits up to 90 s for LTE registration,
-starts `$QCRMCALL`, brings up `wwan0`, waits for SLAAC, appends DNS64
-nameservers, then ping-tests.
+the SIM, waits up to 90 s for LTE registration, then dials and brings up
+`wwan0`. The bring-up is self-healing:
+
+* **ESM settle** — waits 8 s after `+CEREG: 0,1` before dialing.
+  Dialing instantly gets `+CEER: ESM sync up with network` rejects
+  while the attach (including the IMS PDN that carries VoLTE) is still
+  being set up.
+* **Ride the attach bearer first** — each round starts with `AT+CGACT?`;
+  if the network already activated a non-IMS context (seen live as
+  `+CGACT: 2,1`), `$QCRMCALL` starts on *that* cid without redefining
+  anything — the network can reject a second PDN request while happily
+  serving the first.
+* **APN walk** — the cached winner, the modem's own cid1 definition
+  (whatever ModemManager last connected with), `wholesale` (Tello —
+  confirmed against the host's working NetworkManager profile), then
+  `fast.t-mobile.com` and `tello.com`.
+* **PDP-type walk** — each APN is tried as `IPV6`, then `IPV4V6` (the
+  host's proven ModemManager bearer was ipv4v6; some plans reject
+  v6-only contexts with an instant `NO CARRIER`).
+* **NO CARRIER = try again** — weak RF (the basement) rejects calls
+  that succeed moments later. Every dial retries once, the whole walk
+  runs `MODEM_DIAL_ROUNDS` (4) times with a PS re-attach between rounds
+  (`AT+CGATT=0/1` — also required for a rewritten cid1 to take effect),
+  and after that the worker idles and redials forever every
+  `MODEM_REDIAL_IDLE_S` (120 s), like the phone app does. Every
+  rejection logs `AT+CEER` (the network's actual reject cause) and
+  `AT+CPSI?` (real RSRP, far more honest than CSQ indoors).
+* **Automatic raw-ip** — if the call is up but no SLAAC address arrives
+  in 20 s, qmi_wwan framing is flipped to raw-ip and the call re-dialed
+  (many SIM7600 firmwares only speak raw-ip; no manual toggle needed).
+* **QMI fallback (uqmi)** — each round ends with
+  `uqmi --start-network --apn wholesale` on `/dev/cdc-wdm0` — the exact
+  mechanism ModemManager used for the proven host connection, in case
+  `$QCRMCALL` is the broken layer.
+* **Module reset once** — if a whole dial cycle fails, `AT+CFUN=1,1`
+  reboots the module and everything is retried. Firmware state survives
+  USB passthrough: a QMI/WDS session left by host-side ModemManager can
+  make every `$QCRMCALL` fail instantly with a stale
+  `+CEER: EMM detached` even though CEREG shows registered and bearers
+  are active. `MODEM_RESET_ON_FAIL=n` disables it.
+* **Carrier DNS** — `AT+CGCONTRDP` (in `AT+CGPIAF` colon notation) puts
+  T-Mobile's own DNS64 servers into resolv.conf first; the Google DNS64
+  anycast stays as fallback.
+* **Success cache** — the APN + framing that worked land in
+  `/etc/modem.cache`, so the next boot connects on the first try.
+  Delete the file to re-probe from scratch.
 
 * Watch it work: `tail -f /tmp/modem-boot.log`
 * One-word answer: `cat /tmp/modem.status` → `up:wwan0` / `failed: …`
@@ -98,10 +143,15 @@ nameservers, then ping-tests.
 Overrides live in `/etc/default/modem` (plain sh, all optional):
 
 ```sh
-MODEM_APN="fast.t-mobile.com"
-MODEM_PDPTYPE="IPV6"        # or IP / IPV4V6
+MODEM_APN="wholesale"        # first configured APN (Tello data APN)
+MODEM_APN_FALLBACKS="fast.t-mobile.com tello.com"
+MODEM_PDPTYPE="IPV6"         # preferred context type
+MODEM_PDPTYPE_FALLBACKS="IPV4V6"
 MODEM_PORT="/dev/ttyUSB2"
-MODEM_RAW_IP="auto"         # set "y" if SLAAC times out (see below)
+MODEM_RAW_IP="auto"          # auto-detected; "y"/"n" to pin the framing
+MODEM_DIAL_ROUNDS=4          # APN-walk rounds before going to slow retry
+MODEM_DIAL_RETRY_WAIT_S=15   # pause between rounds
+MODEM_REDIAL_IDLE_S=120      # forever-retry cadence after the rounds
 ```
 
 ## Stage 3 — the software (ModemService)
@@ -173,15 +223,49 @@ probe-or-simulate pattern as BatteryService):
   console. In Simulation Mode it lists which ttyUSB nodes exist instead
   of bailing out.
 
+## Stage 4 — proving the full stack (modem = the internet)
+
+`scripts/qemu_modem_data_test.py` is the one-command end-to-end proof.
+It boots the image headless (`-snapshot`, so rootfs.ext4 is untouched)
+with the modem passed through, logs in over the serial socket, waits for
+S45modem's verdict, then checks: wwan0 global IPv6, default route,
+ping to a real v6 literal, DNS resolution, HTTP fetch, HTTPS fetch (the
+exact path NetSurf uses — libcurl + the target CA bundle).
+
+```sh
+# host, from neodct/: close any other QEMU using the modem first
+scripts/qemu_modem_data_test.py            # → RESULT: PASS/FAIL + boot log
+```
+
+Manual equivalent inside any running guest (serial console):
+
+```sh
+/etc/init.d/S45modem restart
+sleep 60; cat /tmp/modem.status; tail -30 /tmp/modem-boot.log
+ping -6 -c 2 2606:4700:4700::1111    # image ≥ this commit; else use curl
+curl -sI https://example.com          # DNS64 + NAT64 + TLS, full browser path
+```
+
+Once `modem.status` says `up:wwan0`, NetSurf needs nothing special: it
+resolves via resolv.conf (DNS64 synthesizes AAAA for v4-only sites) and
+routes over wwan0's SLAAC default route. In a QEMU that *also* has
+usernet `eth0`, IPv6 wins by address-sort, so traffic still prefers the
+modem — unplug eth0 (or boot the modem-only QEMU command) to be sure.
+
 ## Troubleshooting
 
 | Symptom | Meaning / fix |
 |---------|---------------|
 | no `/dev/ttyUSB*` | `lsusb` shows `1e0e:9001`? If yes: kernel missing `option` driver (needs the 0.3.0a image). If no: passthrough/cable/power. |
+| interface isn't called `wwan0` | Normal — eudev predictable naming renames it (QEMU: `wwp0s5u3i5`). S45modem and the Modem app find it by the `qmi_wwan` driver, not the name; substitute your name in any manual command here. |
 | `+CSQ: 99,99` forever | No RF: antenna, or modem brownout-rebooted (cap bodge). |
 | `+CEREG: 0,2` stuck | Searching. Check antenna + `AT+CPIN?`; give it 1–2 min. |
 | `+CEREG: 0,3` | Registration denied — APN/SIM plan issue usually. |
-| `$QCRMCALL` OK but no SLAAC address | Toggle framing: `MODEM_RAW_IP=y` in `/etc/default/modem` (or manually: `ip link set wwan0 down; echo Y > /sys/class/net/wwan0/qmi/raw_ip; ip link set wwan0 up`). |
+| `$QCRMCALL` OK but no SLAAC address | S45modem now flips raw-ip framing by itself; if hand-testing: `ip link set wwan0 down; echo Y > /sys/class/net/wwan0/qmi/raw_ip; ip link set wwan0 up` and re-dial. |
+| `$QCRMCALL` → `NO CARRIER` instantly | Read the `cause:` (AT+CEER) lines in `/tmp/modem-boot.log`. "ESM sync up with network" = dialed too soon / second-PDN collision — the ride-the-attach-bearer path and settle delay handle it. "EMM detached" while CEREG=1 and `cgact:` shows active bearers = stale firmware state (usually host ModemManager's leftover QMI session) — the automatic `AT+CFUN=1,1` reset clears it. Cause #33 "service option not subscribed" = APN/plan. RF causes clear on retry — the worker keeps redialing every 2 min on its own. Check `cell:` (CPSI): field 12 is RSRP×10 (−1134 = −113.4 dBm; below ≈ −115 is cell-edge), field 11 RSRQ×10 (−185 = −18.5 dB, poor). |
+| `$QCRMCALL` broken no matter what | The QMI path is the escape hatch (it's what ModemManager uses): `uqmi -d /dev/cdc-wdm0 --start-network --apn wholesale --ip-family ipv6`, then watch for SLAAC. S45modem tries this automatically at the end of every round. |
+| every APN fails (`no data call yet`) | Wrong APN for the SIM (Tello = `wholesale`) or the plan has no data. Check `/tmp/modem-boot.log` for which were tried; delete `/etc/modem.cache` after changing plans. The proven-good APN is whatever the host's NetworkManager profile used: `nmcli -g gsm.apn connection show <name>`. |
 | ping works, names don't | resolv.conf lacks a DNS64 server (Stage 1 step). |
+| `ping -6` says invalid option | Image older than the busybox `PING6` fragment — use `curl -g 'http://[2606:4700:4700::1111]/'` instead. |
 | `atcmd: modem port busy` | S45modem mid-registration or UI polling — it clears in seconds. |
 | everything vanished mid-test | Modem rebooted (power) or host re-grabbed it (ModemManager). |

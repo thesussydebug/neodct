@@ -14,7 +14,7 @@ case "$1" in
     #   --speed 60     SPI clock in MHz (default 20; you validated 60)
     #   --yoff 65      panel row where the UI band starts (default 65)
     #   --stats        5s perf reports in the log
-    /NeoDCT/System/hw/neodct_displayd --speed 60 \
+    /NeoDCT/System/hw/neodct_displayd --speed 16 \
         > /var/log/neodct_displayd.log 2>&1 &
     ;;
   stop)

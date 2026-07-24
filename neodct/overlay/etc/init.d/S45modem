@@ -3,9 +3,30 @@
 # S45modem -- bring the SIM7600 onto the cellular network at boot.
 #
 # Strategy (per the 0.3.0a modem plan): no ModemManager, no libqmi. The
-# option driver gives us AT ports, qmi_wwan gives us wwan0, and the modem
-# firmware does the heavy lifting via AT$QCRMCALL. T-Mobile is IPv6-only
-# (NAT64/DNS64), so the default context is IPV6 + SLAAC.
+# option driver gives us AT ports, qmi_wwan gives us the network
+# interface, and the modem firmware does the heavy lifting via
+# AT$QCRMCALL. T-Mobile is IPv6-only (NAT64/DNS64), so the preferred
+# context is IPV6 + SLAAC, with IPV4V6 as the automatic fallback (the
+# host's proven ModemManager connection negotiated ipv4v6).
+#
+# Data bring-up is self-healing:
+#   * APN walk -- cache, the modem's own cid1 definition, "wholesale"
+#     (Tello, our SIM), then native T-Mobile APNs.
+#   * PDP-type walk per APN -- IPV6 first, then IPV4V6.
+#   * MODEM_RAW_IP=auto really is automatic: call up but no SLAAC ->
+#     flip qmi_wwan to raw-ip framing and re-dial.
+#   * NO CARRIER is treated as weak-RF/transient (it is, in the
+#     basement): each dial retries once, the whole APN walk runs up to
+#     MODEM_DIAL_ROUNDS times with a PS re-attach between rounds (also
+#     required for a rewritten cid1 to take effect), and after that the
+#     worker keeps redialing forever every MODEM_REDIAL_IDLE_S.
+#   * AT+CEER after every rejection logs the network's reject cause;
+#     AT+CPSI? logs real LTE signal (RSRP), not just CSQ.
+#   * Carrier DNS (AT+CGCONTRDP) lands in resolv.conf first; the Google
+#     DNS64 anycast stays as fallback.
+#   * The APN + PDP type + framing that worked are cached in
+#     /etc/modem.cache so the next boot connects on the first try.
+#     Delete that file to re-probe from scratch.
 #
 # Everything runs backgrounded so boot never blocks on cell registration.
 # Progress log: /tmp/modem-boot.log   Status flag: /tmp/modem.status
@@ -17,18 +38,28 @@
 ATCMD=/NeoDCT/System/engineering/tools/atcmd
 
 MODEM_PORT="${MODEM_PORT:-/dev/ttyUSB2}"
-MODEM_APN="${MODEM_APN:-fast.t-mobile.com}"
+MODEM_APN="${MODEM_APN:-wholesale}"          # Tello (T-Mobile MVNO) data APN
+MODEM_APN_FALLBACKS="${MODEM_APN_FALLBACKS:-fast.t-mobile.com tello.com}"
 MODEM_PDPTYPE="${MODEM_PDPTYPE:-IPV6}"       # IPV6 | IP | IPV4V6
+MODEM_PDPTYPE_FALLBACKS="${MODEM_PDPTYPE_FALLBACKS:-IPV4V6}"
 MODEM_RAW_IP="${MODEM_RAW_IP:-auto}"         # auto | y | n  (qmi_wwan framing)
 MODEM_DNS="${MODEM_DNS:-2001:4860:4860::6464 2001:4860:4860::64}"  # Google DNS64
 MODEM_PORT_WAIT_S=30
 MODEM_REG_WAIT_S=90
+MODEM_ADDR_WAIT_S=20
+MODEM_DIAL_ROUNDS="${MODEM_DIAL_ROUNDS:-4}"
+MODEM_DIAL_RETRY_WAIT_S="${MODEM_DIAL_RETRY_WAIT_S:-15}"
+MODEM_REDIAL_IDLE_S="${MODEM_REDIAL_IDLE_S:-120}"
+MODEM_ESM_SETTLE_S="${MODEM_ESM_SETTLE_S:-8}"   # pause after CEREG before dialing
+MODEM_RESET_ON_FAIL="${MODEM_RESET_ON_FAIL:-y}" # AT+CFUN=1,1 once if all dials fail
 
 [ -r /etc/default/modem ] && . /etc/default/modem
 
 LOG=/tmp/modem-boot.log
 STATUS=/tmp/modem.status
 PIDFILE=/tmp/modem-boot.pid
+CACHE=/etc/modem.cache        # written on success: CACHED_APN/_PDP/_RAW
+RESOLV=/etc/resolv.conf       # symlink into /run -- only ever append through it
 
 log() {
     echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"
@@ -42,6 +73,297 @@ fail() {
 
 at() {
     "$ATCMD" -p "$MODEM_PORT" -t "${2:-6}" "$1" 2>> "$LOG"
+}
+
+# The qmi_wwan interface is NOT reliably called wwan0: eudev's
+# predictable naming renames it to wwp<path> (seen in QEMU: wwp0s4u3i5).
+# Match by driver first, name prefix as fallback.
+find_wwan() {
+    WWAN_IF=""
+    for d in /sys/class/net/*; do
+        [ -e "$d/device/driver" ] || continue
+        case "$(readlink -f "$d/device/driver" 2>/dev/null)" in
+            */qmi_wwan) WWAN_IF=$(basename "$d"); break ;;
+        esac
+    done
+    [ -n "$WWAN_IF" ] \
+        || WWAN_IF=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^(ww|rmnet|usb0)') || true
+    [ -n "$WWAN_IF" ] && [ -d "/sys/class/net/$WWAN_IF" ]
+}
+
+set_raw_ip() {   # $1 = Y | N
+    [ -w "/sys/class/net/$WWAN_IF/qmi/raw_ip" ] || return 1
+    [ "$(cat "/sys/class/net/$WWAN_IF/qmi/raw_ip" 2>/dev/null)" = "$1" ] && return 0
+    ip link set "$WWAN_IF" down 2>> "$LOG"
+    echo "$1" > "/sys/class/net/$WWAN_IF/qmi/raw_ip" 2>> "$LOG" || return 1
+    ip link set "$WWAN_IF" up 2>> "$LOG"
+    log "$WWAN_IF framing set to raw_ip=$1"
+}
+
+start_call() { at 'AT$QCRMCALL=1,'"$1" 20 | tee -a "$LOG" | grep -q '^OK$'; }
+stop_call()  { at 'AT$QCRMCALL=0,'"$1" 10 >> /dev/null 2>&1; }
+
+prep_wwan() {
+    find_wwan || return 1
+    sysctl -qw "net.ipv6.conf.$WWAN_IF.accept_ra=2" \
+               "net.ipv6.conf.$WWAN_IF.disable_ipv6=0" 2>> "$LOG"
+    case "$MODEM_RAW_IP" in
+        [yY]*) set_raw_ip Y ;;
+        [nN]*) set_raw_ip N ;;
+        auto)  [ -n "$CACHED_RAW" ] && set_raw_ip "$CACHED_RAW" ;;
+    esac
+    ip link set "$WWAN_IF" up 2>> "$LOG" || return 1
+    log "$WWAN_IF up (framing raw_ip=$(cat "/sys/class/net/$WWAN_IF/qmi/raw_ip" 2>/dev/null || echo '?'))"
+}
+
+# Full module reboot: clears firmware state that survives USB
+# passthrough -- e.g. the QMI/WDS session host-side ModemManager left
+# behind, which can make every $QCRMCALL fail instantly ("EMM detached"
+# from AT+CEER while CEREG says registered = stale internal state).
+module_reset() {
+    log "rebooting the module (AT+CFUN=1,1) to clear stale firmware state"
+    at 'AT+CFUN=1,1' 10 >> /dev/null 2>&1
+    sleep 3
+    w=0   # ride out the USB re-enumeration (port may vanish briefly)
+    while [ -c "$MODEM_PORT" ] && [ "$w" -lt 15 ]; do w=$((w + 1)); sleep 1; done
+    w=0
+    until [ -c "$MODEM_PORT" ]; do
+        w=$((w + 1))
+        [ "$w" -ge 60 ] && { log "AT port never returned after reset"; return 1; }
+        sleep 1
+    done
+    tries=0
+    until at "AT" 3 | grep -q '^OK$'; do
+        tries=$((tries + 1))
+        [ "$tries" -ge 15 ] && { log "modem silent after reset"; return 1; }
+        sleep 2
+    done
+    at "ATE0" >> /dev/null
+    at "AT+CMEE=2" >> /dev/null
+    log "module back after reset"
+    wait_registered "$MODEM_REG_WAIT_S" || log "not re-registered yet (CEREG: $LAST_REG)"
+    log "letting ESM settle ${MODEM_ESM_SETTLE_S}s"
+    sleep "$MODEM_ESM_SETTLE_S"
+    prep_wwan || log "wwan interface missing after reset"
+    return 0
+}
+
+diag_reject() {
+    log "  cause: $(at 'AT+CEER' 8 | grep -v '^OK$' | tr '\n' ' ')"
+    log "  cell:  $(at 'AT+CPSI?' 8 | grep '+CPSI')"
+    log "  cgact: $(at 'AT+CGACT?' 8 | grep '+CGACT' | tr '\n' ' ')"
+    log "  rmcall: $(at 'AT$QCRMCALL?' 8 | tr '\n' ' ')"
+}
+
+# Start the RmNet call on a cid; one quick retry because weak RF loves
+# to say NO CARRIER once and then connect.
+dial() {   # $1 = cid
+    start_call "$1" && return 0
+    log "  AT\$QCRMCALL=1,$1 rejected; diagnostics:"
+    diag_reject
+    sleep 4
+    start_call "$1"
+}
+
+wait_registered() {   # $1 = max seconds; sets LAST_REG on failure
+    w=0
+    while :; do
+        LAST_REG=$(at "AT+CEREG?" | grep '+CEREG:')
+        case "$LAST_REG" in
+            *": "*",1"*|*": "*",5"*) return 0 ;;
+        esac
+        w=$((w + 2))
+        [ "$w" -ge "$1" ] && return 1
+        sleep 2
+    done
+}
+
+wait_v6() {   # $1 = max seconds to wait for a global-scope SLAAC address
+    v=0
+    until ip -6 addr show dev "$WWAN_IF" scope global 2>/dev/null | grep -q inet6; do
+        v=$((v + 2))
+        [ "$v" -ge "$1" ] && return 1
+        sleep 2
+    done
+}
+
+# One RmNet attempt on an arbitrary cid. Success = usable address on
+# $WWAN_IF. Family hint "" means "whatever the bearer gives us".
+try_bearer() {   # $1 = cid, $2 = family hint (IPV6 / IPV4V6 / IP / "")
+    CID="$1"
+    dial "$CID" || return 1
+    got=""
+    case "$2" in
+        ""|*V6*|*v6*)
+            if wait_v6 "$MODEM_ADDR_WAIT_S"; then
+                got=v6
+            elif [ "$MODEM_RAW_IP" = "auto" ] && [ "$RAW_FLIPPED" != "y" ]; then
+                # Call up but no RA: the classic wrong-framing symptom.
+                RAW_FLIPPED=y
+                log "no SLAAC in ${MODEM_ADDR_WAIT_S}s -- flipping to raw-ip framing"
+                stop_call "$CID"
+                set_raw_ip Y
+                dial "$CID" || return 1
+                wait_v6 "$MODEM_ADDR_WAIT_S" && got=v6
+            fi
+            ;;
+    esac
+    case "$2" in
+        IP|IPV4V6)
+            udhcpc -i "$WWAN_IF" -n -q -t 5 >> "$LOG" 2>&1 && got="${got:+$got+}v4"
+            ;;
+        "")
+            [ -n "$got" ] || { udhcpc -i "$WWAN_IF" -n -q -t 5 >> "$LOG" 2>&1 && got=v4; }
+            ;;
+    esac
+    if [ -z "$got" ]; then
+        log "call up but no usable address on this attempt"
+        stop_call "$CID"
+        return 1
+    fi
+    case "$got" in *v6*)
+        log "IPv6: $(ip -6 addr show dev "$WWAN_IF" scope global | grep inet6 | head -1)"
+    esac
+    log "address family up: $got (cid $CID)"
+    return 0
+}
+
+try_apn() {   # $1 = apn, $2 = pdp type
+    log "trying APN \"$1\" ($2) on cid 1"
+    at "AT+CGDCONT=1,\"$2\",\"$1\"" | grep -q '^OK$' \
+        || { log "AT+CGDCONT rejected"; return 1; }
+    try_bearer 1 "$2"
+}
+
+# The QMI path -- what ModemManager used on the host, proven to work
+# with this SIM and tower. Needs the uqmi package (post-0.3.0a image).
+try_uqmi() {   # $1 = apn
+    command -v uqmi > /dev/null 2>&1 || return 1
+    UQMI_DEV=$(ls /dev/cdc-wdm* 2>/dev/null | head -1)
+    [ -n "$UQMI_DEV" ] || return 1
+    log "QMI fallback via $UQMI_DEV: start-network apn=$1"
+    OUT=$(uqmi -d "$UQMI_DEV" -t 15000 --start-network --apn "$1" --ip-family ipv6 2>&1 | head -2)
+    case "$OUT" in
+        *nknown\ option*|*sage:*)   # older uqmi without --ip-family
+            OUT=$(uqmi -d "$UQMI_DEV" -t 15000 --start-network --apn "$1" 2>&1 | head -2)
+            ;;
+    esac
+    log "  uqmi: $(printf '%s' "$OUT" | tr '\n' ' ')"
+    got=""
+    if wait_v6 "$MODEM_ADDR_WAIT_S"; then
+        got=v6
+    elif [ "$MODEM_RAW_IP" = "auto" ] && [ "$RAW_FLIPPED" != "y" ]; then
+        RAW_FLIPPED=y
+        log "no SLAAC -- flipping to raw-ip framing"
+        set_raw_ip Y
+        wait_v6 "$MODEM_ADDR_WAIT_S" && got=v6
+    fi
+    [ -n "$got" ] || { udhcpc -i "$WWAN_IF" -n -q -t 5 >> "$LOG" 2>&1 && got=v4; }
+    [ -n "$got" ] || { log "  uqmi path: no usable address either"; return 1; }
+    log "address family up: $got (via QMI)"
+    GOOD_APN="$1"
+    GOOD_PDP="qmi"
+    GOOD_CID=qmi
+    return 0
+}
+
+# Walk APNs x PDP types once per round; re-attach PS between rounds so a
+# rewritten cid1 actually takes effect (SIM7600 ignores CGDCONT changes
+# while attached) and weak RF gets a fresh start.
+dial_rounds() {
+    round=1
+    while [ "$round" -le "$MODEM_DIAL_ROUNDS" ]; do
+        if [ "$round" -gt 1 ]; then
+            log "dial round $round/$MODEM_DIAL_ROUNDS: re-attaching PS"
+            at 'AT+CGATT=0' 20 >> /dev/null
+            sleep 2
+            at 'AT+CGATT=1' 30 >> /dev/null
+            sleep 3
+        fi
+        # The basement drops service mid-walk sometimes; don't dial into
+        # the void.
+        if ! wait_registered 45; then
+            log "not registered right now (CEREG: $LAST_REG); skipping round $round"
+            round=$((round + 1))
+            sleep "$MODEM_DIAL_RETRY_WAIT_S"
+            continue
+        fi
+        # First choice each round: ride a bearer the attach already
+        # established -- the network can reject a second PDN request
+        # ("ESM sync up with network") while happily serving the first.
+        DEFS=$(at 'AT+CGDCONT?' 8 | grep '+CGDCONT:')
+        log "contexts: $(printf '%s' "$DEFS" | tr '\n' ' ')"
+        for c in $(at 'AT+CGACT?' 8 | sed -n 's/+CGACT: \([0-9]*\),1.*/\1/p'); do
+            DEF=$(printf '%s\n' "$DEFS" | grep "+CGDCONT: $c,")
+            case "$DEF" in
+                *ims*|*IMS*|*sos*|*SOS*) log "cid $c is IMS/emergency; not for data"; continue ;;
+            esac
+            log "riding already-active context $c: ${DEF:-no definition}"
+            if try_bearer "$c" ""; then
+                GOOD_APN="(attach bearer, cid $c)"
+                GOOD_PDP="as-attached"
+                GOOD_CID="$c"
+                return 0
+            fi
+        done
+        TRIED=""
+        for apn in $CACHED_APN $CUR_APN $MODEM_APN $MODEM_APN_FALLBACKS; do
+            case " $TRIED " in *" $apn "*) continue ;; esac
+            TRIED="$TRIED $apn"
+            TTRIED=""
+            for pdp in $CACHED_PDP $MODEM_PDPTYPE $MODEM_PDPTYPE_FALLBACKS; do
+                case " $TTRIED " in *" $pdp "*) continue ;; esac
+                TTRIED="$TTRIED $pdp"
+                if try_apn "$apn" "$pdp"; then
+                    GOOD_APN="$apn"
+                    GOOD_PDP="$pdp"
+                    GOOD_CID=1
+                    return 0
+                fi
+            done
+        done
+        try_uqmi "$MODEM_APN" && return 0
+        round=$((round + 1))
+        [ "$round" -le "$MODEM_DIAL_ROUNDS" ] && sleep "$MODEM_DIAL_RETRY_WAIT_S"
+    done
+    return 1
+}
+
+setup_dns() {
+    # Ask for standard colon notation first, else CGCONTRDP prints IPv6
+    # as sixteen dot-separated decimals (3GPP 27.007 default).
+    at 'AT+CGPIAF=1,1,0,0' >> /dev/null 2>&1
+    case "${GOOD_CID:-1}" in
+        *[!0-9]*) RDPCID=1 ;;    # qmi session: read the default context
+        *)        RDPCID=${GOOD_CID:-1} ;;
+    esac
+    RDP=$(at "AT+CGCONTRDP=$RDPCID" 8 | grep '+CGCONTRDP:' | head -1)
+    log "context readback: ${RDP:-none}"
+    # Quoted fields are apn,local,gateway,dns1,dns2 -> tr puts their
+    # contents on even lines: 2,4,6,8,10.
+    CARRIER_DNS=$(printf '%s\n' "$RDP" | tr '"' '\n' | sed -n '8p;10p' \
+                  | grep -E '^[0-9a-fA-F:.]+$')
+    [ -n "$CARRIER_DNS" ] && log "carrier DNS: $(echo $CARRIER_DNS)"
+    for ns in $CARRIER_DNS $MODEM_DNS; do
+        grep -qs "nameserver $ns" "$RESOLV" || echo "nameserver $ns" >> "$RESOLV"
+    done
+}
+
+verify_net() {
+    ip -6 route 2>/dev/null | grep '^default' >> "$LOG"
+    if ping -6 -c 1 -W 3 2606:4700:4700::1111 > /dev/null 2>&1 \
+       || ping6 -c 1 2606:4700:4700::1111 > /dev/null 2>&1; then
+        log "connectivity OK (ping6 2606:4700:4700::1111)"
+    elif command -v curl > /dev/null 2>&1 \
+         && curl -g -m 10 -sf -o /dev/null 'http://[2606:4700:4700::1111]/'; then
+        log "connectivity OK (curl over IPv6 literal)"
+    else
+        log "no connectivity proof yet (route/DNS64 may still settle)"
+    fi
+    if command -v curl > /dev/null 2>&1 \
+       && curl -m 12 -sf -o /dev/null http://example.com/; then
+        log "DNS + fetch OK (http://example.com)"
+    fi
 }
 
 worker() {
@@ -75,75 +397,72 @@ worker() {
     fi
     log "SIM ready"
 
-    # 4. Define the PDP context (cid 1).
-    at "AT+CGDCONT=1,\"$MODEM_PDPTYPE\",\"$MODEM_APN\"" | grep -q '^OK$' \
-        || fail "AT+CGDCONT rejected"
-    log "PDP context 1 = $MODEM_PDPTYPE / $MODEM_APN"
-
-    # 5. Wait for LTE registration (home or roaming).
-    waited=0
-    while :; do
-        REG=$(at "AT+CEREG?" | grep '+CEREG:')
-        case "$REG" in
-            *": "*",1"*|*": "*",5"*) log "registered: $REG"; break ;;
-        esac
-        waited=$((waited + 2))
-        if [ "$waited" -ge "$MODEM_REG_WAIT_S" ]; then
-            log "last CEREG: $REG   CSQ: $(at 'AT+CSQ' | grep '+CSQ')"
-            fail "no LTE registration after ${MODEM_REG_WAIT_S}s"
-        fi
-        sleep 2
-    done
+    # 4. Wait for LTE registration (home or roaming).
+    if ! wait_registered "$MODEM_REG_WAIT_S"; then
+        log "last CEREG: $LAST_REG   CSQ: $(at 'AT+CSQ' | grep '+CSQ')"
+        fail "no LTE registration after ${MODEM_REG_WAIT_S}s"
+    fi
+    log "registered: $LAST_REG"
     log "signal: $(at 'AT+CSQ' | grep '+CSQ')  operator: $(at 'AT+COPS?' | grep '+COPS')"
+    log "cell: $(at 'AT+CPSI?' 8 | grep '+CPSI')"
+    # Dialing the instant CEREG goes 1 gets "ESM sync up with network"
+    # rejects: the attach (incl. the IMS PDN) is still settling.
+    log "letting ESM settle ${MODEM_ESM_SETTLE_S}s before dialing"
+    sleep "$MODEM_ESM_SETTLE_S"
 
-    # 6. Start the RmNet data call on cid 1 (firmware-driven, no libqmi).
-    at 'AT$QCRMCALL=1,1' 15 | tee -a "$LOG" | grep -q '^OK$' \
-        || fail 'AT$QCRMCALL=1,1 rejected'
-    log "data call started"
+    # 5. Prep the qmi_wwan interface BEFORE dialing so the RS/RA exchange
+    #    can happen the moment the bearer comes up.
+    RAW_FLIPPED=n
+    CACHED_APN=""
+    CACHED_PDP=""
+    CACHED_RAW=""
+    [ -r "$CACHE" ] && . "$CACHE"
+    prep_wwan || fail "no wwan network interface found (qmi_wwan missing?)"
+    stop_call 1   # clear any half-open call from a previous run
 
-    # 7. Host side: find the qmi_wwan interface and bring it up.
-    WWAN_IF=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^(wwan|rmnet)') || true
-    [ -n "$WWAN_IF" ] || WWAN_IF=usb0
-    [ -d "/sys/class/net/$WWAN_IF" ] || fail "no wwan network interface found"
+    # The modem's current cid1 may hold the definition the host's
+    # ModemManager connected with -- worth trying early.
+    CUR=$(at 'AT+CGDCONT?' 8 | grep '+CGDCONT: 1,')
+    CUR_APN=$(printf '%s\n' "$CUR" | tr '"' '\n' | sed -n '4p')
+    log "modem cid1 now: ${CUR:-none}"
 
-    if [ "$MODEM_RAW_IP" = "y" ] && [ -w "/sys/class/net/$WWAN_IF/qmi/raw_ip" ]; then
-        ip link set "$WWAN_IF" down 2>> "$LOG"
-        echo Y > "/sys/class/net/$WWAN_IF/qmi/raw_ip"
-        log "$WWAN_IF switched to raw-ip framing"
+    # 6. Dial until it works. Weak-RF reality: NO CARRIER now often
+    #    connects later, so after the quick rounds the worker idles and
+    #    keeps redialing forever (like the phone app does).
+    GOOD_APN=""
+    GOOD_PDP=""
+    GOOD_CID=1
+    RESET_DONE=n
+    until dial_rounds; do
+        if [ "$RESET_DONE" = "n" ] && [ "$MODEM_RESET_ON_FAIL" = "y" ]; then
+            RESET_DONE=y
+            module_reset && continue
+        fi
+        echo "failed: no data call yet, still retrying (see $LOG)" > "$STATUS"
+        log "all rounds rejected; idling ${MODEM_REDIAL_IDLE_S}s before the next cycle"
+        sleep "$MODEM_REDIAL_IDLE_S"
+        # Keep the log from growing without bound across cycles.
+        logsize=$(wc -c < "$LOG" 2>/dev/null)
+        if [ "${logsize:-0}" -gt 65536 ]; then
+            tail -c 32768 "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"
+        fi
+        wait_registered 30 || log "registration currently down (CEREG: $LAST_REG)"
+    done
+    log "data call up on APN \"$GOOD_APN\" ($GOOD_PDP)"
+    echo "$GOOD_CID" > /tmp/modem-cid
+    # Only cache a real APN walked on cid 1 -- a ridden attach bearer is
+    # rediscovered fresh every boot.
+    if [ "$GOOD_CID" = "1" ]; then
+        {
+            echo "CACHED_APN=$GOOD_APN"
+            echo "CACHED_PDP=$GOOD_PDP"
+            echo "CACHED_RAW=$(cat "/sys/class/net/$WWAN_IF/qmi/raw_ip" 2>/dev/null)"
+        } > "$CACHE" 2>/dev/null
     fi
 
-    sysctl -qw "net.ipv6.conf.$WWAN_IF.accept_ra=2" \
-               "net.ipv6.conf.$WWAN_IF.disable_ipv6=0" 2>> "$LOG"
-    ip link set "$WWAN_IF" up 2>> "$LOG" || fail "ip link set $WWAN_IF up"
-    log "$WWAN_IF up"
-
-    # 8. Addressing: SLAAC for IPv6 (T-Mobile RAs), DHCP for IPv4 contexts.
-    case "$MODEM_PDPTYPE" in
-        *V6*|*v6*)
-            waited=0
-            until ip -6 addr show dev "$WWAN_IF" scope global 2>/dev/null | grep -q inet6; do
-                waited=$((waited + 2))
-                [ "$waited" -ge 30 ] && fail "no SLAAC address on $WWAN_IF (try MODEM_RAW_IP=y?)"
-                sleep 2
-            done
-            log "IPv6: $(ip -6 addr show dev "$WWAN_IF" scope global | grep inet6 | head -1)"
-            for ns in $MODEM_DNS; do
-                grep -q "$ns" /etc/resolv.conf 2>/dev/null || echo "nameserver $ns" >> /etc/resolv.conf
-            done
-            ;;
-    esac
-    case "$MODEM_PDPTYPE" in
-        IP|IPV4V6)
-            udhcpc -i "$WWAN_IF" -n -q -t 5 >> "$LOG" 2>&1 || log "udhcpc failed (v4 side)"
-            ;;
-    esac
-
-    # 9. Proof of life for the boot log.
-    if ping -6 -c 1 -W 3 2606:4700:4700::1111 >> /dev/null 2>&1; then
-        log "connectivity OK (ping6 2606:4700:4700::1111)"
-    else
-        log "no ping reply yet (route/DNS64 may still settle)"
-    fi
+    # 7. DNS + proof of life for the boot log.
+    setup_dns
+    verify_net
 
     echo "up:$WWAN_IF" > "$STATUS"
     log "DONE: $WWAN_IF is on the cellular network"
@@ -157,7 +476,12 @@ case "$1" in
         ;;
     stop)
         [ -r "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
-        "$ATCMD" -p "$MODEM_PORT" -t 10 'AT$QCRMCALL=0,1' >> /dev/null 2>&1
+        CID=$(cat /tmp/modem-cid 2>/dev/null)
+        case "${CID:-1}" in
+            *[!0-9]*) : ;;   # qmi session: link down below is teardown enough
+            *) "$ATCMD" -p "$MODEM_PORT" -t 10 'AT$QCRMCALL=0,'"${CID:-1}" >> /dev/null 2>&1 ;;
+        esac
+        find_wwan && ip link set "$WWAN_IF" down 2>/dev/null
         echo "stopped" > "$STATUS"
         ;;
     restart)

@@ -159,7 +159,13 @@ def _read_file(path):
 
 def _wwan_interface():
     names = _listdir("/sys/class/net")
-    for prefix in ("wwan", "rmnet", "usb"):
+    # eudev predictable naming renames wwan0 to wwp<path>; trust the
+    # bound driver over the name.
+    for name in sorted(names):
+        driver = os.path.realpath("/sys/class/net/%s/device/driver" % name)
+        if os.path.basename(driver) == "qmi_wwan":
+            return name
+    for prefix in ("ww", "rmnet", "usb"):
         for name in sorted(names):
             if name.startswith(prefix):
                 return name
